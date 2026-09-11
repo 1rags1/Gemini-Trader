@@ -34,6 +34,7 @@ htmlcov/
 # --- Project data / runtime artifacts ---
 logs/
 *.csv
+data/*.csv
 state/
 state/runner.json
 data/cache/

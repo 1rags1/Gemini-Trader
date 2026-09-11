@@ -56,6 +56,9 @@ class Settings:
     #: and body, so it travels as a `?token=` query parameter. Empty disables
     #: the check, which is only safe on a host that is not publicly reachable.
     webhook_secret: str = ""
+    #: Token for the read-only dashboard when it is exposed through a tunnel.
+    #: Falls back to WEBHOOK_SECRET when DASHBOARD_SECRET is unset.
+    dashboard_secret: str = ""
     #: Minimum Gemini confidence required to confirm a TradingView entry.
     min_confidence: float = 0.6
 
@@ -99,6 +102,9 @@ def get_settings() -> Settings:
         webhook_host=os.getenv("WEBHOOK_HOST", "127.0.0.1"),
         webhook_port=int(os.getenv("WEBHOOK_PORT", "5000")),
         webhook_secret=(os.getenv("WEBHOOK_SECRET") or "").strip(),
+        dashboard_secret=(
+            os.getenv("DASHBOARD_SECRET") or os.getenv("WEBHOOK_SECRET") or ""
+        ).strip(),
         min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.6")),
         paths={
             "root": PROJECT_ROOT,

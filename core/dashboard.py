@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import re
+import secrets
 import sys
 import threading
 import time
@@ -25,7 +26,7 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from core.config import PROJECT_ROOT, get_settings
@@ -59,6 +60,36 @@ def _cfg():
         return get_settings()
     except Exception:
         return None
+
+
+def dashboard_secret() -> str:
+    cfg = _cfg()
+    if cfg is None:
+        return ""
+    return (getattr(cfg, "dashboard_secret", None) or cfg.webhook_secret or "").strip()
+
+
+#: Headers Cloudflare/cloudflared attach. A laptop browser talking to
+#: 127.0.0.1 will not send these; a phone hitting the tunnel will.
+_TUNNEL_HEADERS = ("cf-ray", "cf-connecting-ip", "cdn-loop")
+
+
+def is_tunneled(request: Request) -> bool:
+    return any(request.headers.get(name) for name in _TUNNEL_HEADERS)
+
+
+def check_token(request: Request, token: str | None) -> None:
+    """Require a token only for the public tunnel, not for localhost."""
+    if not is_tunneled(request):
+        return
+    secret = dashboard_secret()
+    if not secret:
+        raise HTTPException(
+            status_code=401,
+            detail="set DASHBOARD_SECRET or WEBHOOK_SECRET before tunneling",
+        )
+    if not token or not secrets.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="invalid or missing token")
 
 
 def _paths() -> dict[str, Path]:
@@ -477,7 +508,10 @@ PAGE = r"""<!DOCTYPE html>
 
     async function tick() {
       try {
-        const res = await fetch("/api/snapshot", { cache: "no-store" });
+        const token = new URLSearchParams(location.search).get("token") || "";
+        const qs = token ? ("?token=" + encodeURIComponent(token)) : "";
+        const res = await fetch("/api/snapshot" + qs, { cache: "no-store" });
+        if (res.status === 401) throw new Error("add ?token= from DASHBOARD_SECRET or WEBHOOK_SECRET");
         if (!res.ok) throw new Error("HTTP " + res.status);
         render(await res.json());
         document.getElementById("status").textContent = "live";
@@ -504,12 +538,14 @@ app = FastAPI(title="Gemini Trader dashboard", docs_url=None, redoc_url=None)
 
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
+def index(request: Request, token: str | None = Query(default=None)) -> HTMLResponse:
+    check_token(request, token)
     return HTMLResponse(PAGE)
 
 
 @app.get("/api/snapshot")
-def snapshot() -> dict[str, Any]:
+def snapshot(request: Request, token: str | None = Query(default=None)) -> dict[str, Any]:
+    check_token(request, token)
     return build_snapshot()
 
 
@@ -523,7 +559,13 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     enable_os_trust_store()
-    print(f"Dashboard on http://{args.host}:{args.port}  (read-only, Ctrl+C to stop)")
+    secret = dashboard_secret()
+    auth = "token required (?token=)" if secret else "OPEN — set DASHBOARD_SECRET before tunneling"
+    print(f"Dashboard on http://{args.host}:{args.port}  (read-only, {auth})")
+    if secret:
+        print(f"  local bookmark : http://127.0.0.1:{args.port}/?token=<DASHBOARD_SECRET or WEBHOOK_SECRET>")
+        print(f"  phone          : cloudflared tunnel --url http://localhost:{args.port}")
+        print("                  then open https://<printed-host>/?token=<same secret>")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
