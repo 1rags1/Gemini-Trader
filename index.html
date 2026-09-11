@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gemini Trader</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1014;
+      --panel: #121a21;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --teal: #5eead4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      place-items: center;
+      padding: 2rem;
+    }
+    main {
+      max-width: 40rem;
+      width: 100%;
+      background: var(--panel);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 1rem;
+      padding: 2rem;
+    }
+    p.kicker {
+      margin: 0 0 0.4rem;
+      font-size: 0.75rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--teal);
+    }
+    h1 { margin: 0 0 1rem; font-size: 1.8rem; }
+    p { color: var(--muted); line-height: 1.55; }
+    code {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      color: var(--teal);
+      font-size: 0.92em;
+    }
+    a { color: var(--teal); }
+    ol { color: var(--muted); padding-left: 1.2rem; }
+    li { margin: 0.4rem 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="kicker">Gemini Trend Guard</p>
+    <h1>Paper-trading bot</h1>
+    <p>
+      This GitHub Pages site is only a project landing page. The live monitor,
+      Gemini confirmations, and paper fills run on your machine — they are not
+      published here, because they need your <code>.env</code> keys and the
+      local runner.
+    </p>
+    <p>On the computer that is running the bot:</p>
+    <ol>
+      <li>Keep the runner going: <code>python -m core.strategy_runner</code></li>
+      <li>Start the desk: <code>python -m core.dashboard</code></li>
+      <li>Open <a href="http://127.0.0.1:8050">http://127.0.0.1:8050</a></li>
+    </ol>
+    <p>
+      Source:
+      <a href="https://github.com/1rags1/Gemini-Trader">github.com/1rags1/Gemini-Trader</a>
+    </p>
+  </main>
+</body>
+</html>
