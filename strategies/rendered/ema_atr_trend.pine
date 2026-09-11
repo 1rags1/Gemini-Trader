@@ -1,0 +1,255 @@
+//@version=5
+// ===========================================================
+// GENERATED FILE - do not edit directly.
+//   template : strategies/templates/ema_atr_trend.pine
+//   params   : strategies/params/ema_atr_trend.json
+//   re-render: python -m strategies.render ema_atr_trend
+// ===========================================================
+strategy("Gemini Trend Guard", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=25, commission_type=strategy.commission.percent, commission_value=0.075)
+
+// ============================================================
+// Inputs - defaults mirror strategies/params/ema_atr_trend.json
+// ============================================================
+// Sizing. default_qty_value above is the fallback used when risk sizing is off.
+// With risk sizing on, quantity is derived from the ATR stop distance so every
+// trade risks the same slice of equity regardless of volatility. Note the
+// arithmetic: notional/equity = riskPct / (atrStop * ATR/price). On 1h BTC,
+// ATR/price is ~0.55%, so a 1.5x ATR stop makes 1% risk demand ~120% notional
+// (i.e. leverage). 0.25% risk lands near 25% notional unlevered; maxNotionalPct
+// is the hard ceiling that keeps a low-volatility regime from over-sizing.
+useRiskSizing   = input.bool(true, "Size positions by ATR risk", group="Sizing")
+riskPerTradePct = input.float(0.25, "Risk per trade (% of equity)", step=0.05, minval=0.01, group="Sizing")
+maxNotionalPct  = input.float(50, "Max notional (% of equity)", step=5, minval=1, group="Sizing")
+
+emaFastLen  = input.int(21, "EMA Fast", minval=1, group="Trend")
+emaSlowLen  = input.int(55, "EMA Slow", minval=1, group="Trend")
+allowShorts = input.bool(true, "Allow Short Entries", group="Trend")
+
+// Regime gate. The baseline run took 271 trades and paid ~40% of equity in
+// commission; these two filters exist to cut trade count, not to add signal.
+emaMacroLen    = input.int(200, "Macro EMA (dominant trend)", minval=1, group="Regime")
+useMacroFilter = input.bool(true, "Trade only with macro EMA", group="Regime")
+adxLen         = input.int(14, "ADX DI Length", minval=1, group="Regime")
+adxSmooth      = input.int(14, "ADX Smoothing", minval=1, group="Regime")
+adxMin         = input.float(20, "Minimum ADX", step=0.5, minval=0, group="Regime")
+useAdxFilter   = input.bool(true, "Require ADX above minimum", group="Regime")
+
+rsiLen   = input.int(14, "RSI Length", minval=1, group="Momentum")
+rsiFloor = input.float(50, "RSI Long Floor", group="Momentum")
+rsiCeil  = input.float(50, "RSI Short Ceiling", group="Momentum")
+
+// Risk. Reward:risk is atrTarget / atrStop and must clear (1 - winRate) /
+// winRate to break even. At 2.5 the break-even win rate is 28.6%; the previous
+// 1.0x stop finished at 28.24%, so the 1.5x stop here is carrying the thesis
+// that a wider stop clears routine 1h noise and recovers win rate.
+atrLen    = input.int(14, "ATR Length", minval=1, group="Risk")
+atrStop   = input.float(1.5, "Initial Stop (ATR mult)", step=0.1, minval=0.1, group="Risk")
+atrTarget = input.float(3.75, "Target (ATR mult)", step=0.1, minval=0.1, group="Risk")
+atrTrail  = input.float(1.75, "Trail Distance (ATR mult)", step=0.1, minval=0.1, group="Risk")
+trailArm  = input.float(2.75, "Trail Activation (ATR mult of profit)", step=0.1, minval=0, group="Risk")
+
+useBreaker      = input.bool(true, "Enable circuit breaker", group="Circuit Breaker")
+maxLossStreak   = input.int(4, "Consecutive losses to trip", minval=1, group="Circuit Breaker")
+breakerCooldown = input.int(24, "Cooldown bars before re-arming", minval=0, group="Circuit Breaker")
+equityLookback  = input.int(500, "Rolling equity lookback (bars)", minval=1, group="Circuit Breaker")
+maxRollingDd    = input.float(15.0, "Max rolling equity drawdown %", step=0.5, minval=0.5, group="Circuit Breaker")
+
+// ============================================================
+// Indicators
+// ============================================================
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaMacro = ta.ema(close, emaMacroLen)
+rsi      = ta.rsi(close, rsiLen)
+atr      = ta.atr(atrLen)
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxSmooth)
+
+// ============================================================
+// Regime filters
+// ============================================================
+// Each filter degrades to `true` when switched off, so the script collapses
+// back to the baseline behaviour for A/B comparison in the Strategy Tester.
+macroBull   = not useMacroFilter or close > emaMacro
+macroBear   = not useMacroFilter or close < emaMacro
+trendStrong = not useAdxFilter or adxValue > adxMin
+
+// ============================================================
+// Circuit breaker
+// ============================================================
+// Trips on a run of losses or a rolling equity drawdown, then blocks new
+// entries until the cooldown has elapsed AND trend strength has returned.
+// Open positions are never abandoned; only new entries are suppressed.
+var int  lossStreak    = 0
+var bool breakerActive = false
+var int  breakerBars   = 0
+
+// A single bar can close more than one trade, so walk every newly closed one.
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    for i = nz(strategy.closedtrades[1]) to strategy.closedtrades - 1
+        lossStreak := strategy.closedtrades.profit(i) < 0 ? lossStreak + 1 : 0
+
+equityPeak   = ta.highest(strategy.equity, equityLookback)
+rollingDd    = equityPeak > 0 ? (equityPeak - strategy.equity) / equityPeak * 100 : 0.0
+equityBreach = rollingDd > maxRollingDd
+
+if useBreaker
+    if not breakerActive and (lossStreak >= maxLossStreak or equityBreach)
+        breakerActive := true
+        breakerBars   := 0
+    else if breakerActive
+        breakerBars += 1
+        if breakerBars >= breakerCooldown and trendStrong and not equityBreach
+            breakerActive := false
+            lossStreak    := 0
+            breakerBars   := 0
+else
+    breakerActive := false
+
+// ============================================================
+// Webhook payload
+// ============================================================
+// Attached to every order via alert_message. In the TradingView alert dialog,
+// set the message body to {{strategy.order.alert_message}} to forward this JSON
+// verbatim. Built by concatenation rather than str.format because Pine's
+// str.format treats braces as placeholders and would mangle the JSON.
+webhookJson(action, reason, stopLvl, tgtLvl) =>
+    '{"strategy":"Gemini Trend Guard"' +
+      ',"action":"' + action + '"' +
+      ',"reason":"' + reason + '"' +
+      ',"ticker":"' + syminfo.tickerid + '"' +
+      ',"timeframe":"' + timeframe.period + '"' +
+      ',"price":' + str.tostring(close, format.mintick) +
+      ',"atr":' + str.tostring(atr, format.mintick) +
+      ',"stop":' + str.tostring(na(stopLvl) ? 0.0 : stopLvl, format.mintick) +
+      ',"target":' + str.tostring(na(tgtLvl) ? 0.0 : tgtLvl, format.mintick) +
+      ',"adx":' + str.tostring(adxValue, "#.##") +
+      ',"macro_ema":' + str.tostring(emaMacro, format.mintick) +
+      ',"loss_streak":' + str.tostring(lossStreak) +
+      ',"breaker_active":' + (breakerActive ? "true" : "false") +
+      ',"position_size":' + str.tostring(strategy.position_size) +
+      ',"bar_time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '"' +
+      '}'
+
+// ============================================================
+// Signals
+// ============================================================
+longSignal  = ta.crossover(emaFast, emaSlow) and rsi > rsiFloor and macroBull and trendStrong and not breakerActive
+shortSignal = allowShorts and ta.crossunder(emaFast, emaSlow) and rsi < rsiCeil and macroBear and trendStrong and not breakerActive
+
+// ============================================================
+// Position sizing
+// ============================================================
+// entryQty resolves to na when risk sizing is off, and Pine then falls back to
+// the strategy() default_qty_type/default_qty_value declaration.
+stopDistance = atr * atrStop
+riskCapital  = strategy.equity * riskPerTradePct / 100
+qtyByRisk    = stopDistance > 0 ? riskCapital / stopDistance : na
+qtyCeiling   = close > 0 ? strategy.equity * maxNotionalPct / 100 / close : na
+entryQty     = useRiskSizing ? math.min(qtyByRisk, qtyCeiling) : na
+
+// ============================================================
+// Entries
+// ============================================================
+if longSignal and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, qty=entryQty,
+      alert_message = webhookJson("BUY", "macro_aligned_trend_long", close - atr * atrStop, close + atr * atrTarget))
+
+if shortSignal and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, qty=entryQty,
+      alert_message = webhookJson("SELL", "macro_aligned_trend_short", close + atr * atrStop, close - atr * atrTarget))
+
+// ============================================================
+// Risk exits: fixed ATR target + breakeven-armed ATR trailing stop
+// ============================================================
+// The stop holds its initial distance until the trade is `trailArm` ATR in
+// profit, then trails `atrTrail` ATR behind price and only ever ratchets.
+// Arming therefore locks in (trailArm - atrTrail) ATR, which in units of R is
+// (trailArm - atrTrail) / atrStop. Widening that gap raises the guaranteed
+// floor; narrowing it clips winners, which is what held realised reward:risk
+// under 1.0 while the trail armed early.
+// ATR is frozen at entry for the stop and target so the levels cannot drift.
+var float entryAtr   = na
+var float trailStop  = na
+var float hardTarget = na
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+if inLong
+    if not inLong[1] or na(entryAtr)
+        entryAtr   := atr
+        trailStop  := strategy.position_avg_price - entryAtr * atrStop
+        hardTarget := strategy.position_avg_price + entryAtr * atrTarget
+    armed = close >= strategy.position_avg_price + entryAtr * trailArm
+    if armed
+        trailStop := math.max(trailStop, close - atr * atrTrail)
+    strategy.exit("Long Exit", from_entry="Long", stop=trailStop, limit=hardTarget,
+      alert_message = webhookJson("SELL", armed ? "atr_trail_long" : "initial_stop_or_target_long", trailStop, hardTarget))
+else if inShort
+    if not inShort[1] or na(entryAtr)
+        entryAtr   := atr
+        trailStop  := strategy.position_avg_price + entryAtr * atrStop
+        hardTarget := strategy.position_avg_price - entryAtr * atrTarget
+    armed = close <= strategy.position_avg_price - entryAtr * trailArm
+    if armed
+        trailStop := math.min(trailStop, close + atr * atrTrail)
+    strategy.exit("Short Exit", from_entry="Short", stop=trailStop, limit=hardTarget,
+      alert_message = webhookJson("BUY", armed ? "atr_trail_short" : "initial_stop_or_target_short", trailStop, hardTarget))
+else
+    entryAtr   := na
+    trailStop  := na
+    hardTarget := na
+
+// ============================================================
+// Visuals
+// ============================================================
+pFast = plot(emaFast, "EMA Fast", color=color.new(color.aqua, 0), linewidth=2)
+pSlow = plot(emaSlow, "EMA Slow", color=color.new(color.orange, 0), linewidth=2)
+fill(pFast, pSlow, color=emaFast > emaSlow ? color.new(color.teal, 85) : color.new(color.maroon, 85), title="Trend Bias")
+plot(emaMacro, "Macro EMA", color=color.new(color.fuchsia, 0), linewidth=2)
+
+plot(trailStop, "ATR Trailing Stop", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(hardTarget, "ATR Target", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+
+// Red wash marks bars where the circuit breaker is suppressing new entries.
+bgcolor(breakerActive ? color.new(color.red, 90) : na, title="Circuit Breaker Active")
+
+plotshape(longSignal, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), textcolor=color.white, size=size.small, text="LONG")
+plotshape(shortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), textcolor=color.white, size=size.small, text="SHORT")
+
+longClosed  = strategy.position_size == 0 and strategy.position_size[1] > 0
+shortClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+plotshape(longClosed, title="Long Exit", style=shape.xcross, location=location.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny, text="EXIT")
+plotshape(shortClosed, title="Short Exit", style=shape.xcross, location=location.belowbar, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny, text="EXIT")
+
+// Live regime readout, so you can see which filter is blocking a trade.
+var table statusTable = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    table.cell(statusTable, 0, 6, "Notional")
+    table.cell(statusTable, 1, 6, useRiskSizing ? str.tostring(entryQty * close / strategy.equity * 100, "#.#") + "% eq" : str.tostring(25) + "% eq")
+    table.cell(statusTable, 0, 0, "Regime", text_color=color.white, bgcolor=color.new(color.gray, 30))
+    table.cell(statusTable, 1, 0, "State", text_color=color.white, bgcolor=color.new(color.gray, 30))
+    table.cell(statusTable, 0, 1, "Macro trend")
+    table.cell(statusTable, 1, 1, close > emaMacro ? "BULL" : "BEAR", text_color=close > emaMacro ? color.teal : color.maroon)
+    table.cell(statusTable, 0, 2, "ADX")
+    table.cell(statusTable, 1, 2, str.tostring(adxValue, "#.#") + (trendStrong ? " ok" : " weak"), text_color=trendStrong ? color.teal : color.maroon)
+    table.cell(statusTable, 0, 3, "Loss streak")
+    table.cell(statusTable, 1, 3, str.tostring(lossStreak) + " / " + str.tostring(maxLossStreak))
+    table.cell(statusTable, 0, 4, "Rolling DD")
+    table.cell(statusTable, 1, 4, str.tostring(rollingDd, "#.#") + "%")
+    table.cell(statusTable, 0, 5, "New entries")
+    table.cell(statusTable, 1, 5, breakerActive ? "BLOCKED" : "ENABLED", text_color=breakerActive ? color.red : color.teal)
+
+// ============================================================
+// Signal-level alerts
+// ============================================================
+// alertcondition messages must be compile-time constants, so these use
+// TradingView's {{...}} substitution tokens instead of series values. Use these
+// when you want a bare signal webhook; use the order alert_message above when
+// you want the strategy's actual fills, stop and target.
+alertcondition(longSignal, "Long Entry Signal",
+  '{"strategy":"Gemini Trend Guard","action":"BUY","ticker":"{{ticker}}","timeframe":"{{interval}}","price":"{{close}}","time":"{{timenow}}"}')
+alertcondition(shortSignal, "Short Entry Signal",
+  '{"strategy":"Gemini Trend Guard","action":"SELL","ticker":"{{ticker}}","timeframe":"{{interval}}","price":"{{close}}","time":"{{timenow}}"}')
+alertcondition(longClosed or shortClosed, "Position Closed",
+  '{"strategy":"Gemini Trend Guard","action":"CLOSE","ticker":"{{ticker}}","timeframe":"{{interval}}","price":"{{close}}","time":"{{timenow}}"}')

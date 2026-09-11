@@ -1,0 +1,49 @@
+{
+  "description": "Trend-following EMA crossover gated by a macro-trend (EMA 200) and ADX regime filter, with a 2.5:1 initial ATR reward/risk structure, an ATR trailing stop that arms only once the trade is well in profit, ATR-normalised position sizing, and a consecutive-loss/equity circuit breaker. Trades only in the direction of the dominant higher trend and stands down after a losing streak until trend strength re-establishes.",
+  "notes": {
+    "run_1": "271 trades, PF 0.621, WR 32.1%, net -47.34%, max DD 52.9%. Stop 2.0x / target 3.0x ATR, no regime filter. Diagnosis: ~40.6% of equity lost to commission against ~-6.7% gross.",
+    "run_2": "85 trades, PF 0.562, WR 28.24%, net -19.98%, max DD 24.19%. Stop 1.0x / target 2.5x ATR with EMA200+ADX filters. Fee drag down 68%, but the 1.0x stop was inside the noise and cost 3.9 points of win rate.",
+    "run_3": "85 trades, WR 34.12% (29/56), avg win +0.97% vs avg loss -1.25%, net -6.82%, max DD 7.91%. Stop 1.5x / target 3.75x, trail armed at 2.0x. Win rate and drawdown both fixed, but realised reward:risk was 0.776 - below 1.0 against a 2.5 nominal - because the trail armed at only +0.33R and clipped winners before the target.",
+    "run_4_thesis": "Arm the trail at 2.75x with a 1.75x trail distance. Two effects: the locked floor rises from +0.33R to +0.67R, and because only 1.0x ATR separates arming from the 3.75x target while the trail sits 1.75x behind price, the trail becomes near-vestigial. The strategy therefore behaves like a fixed 2.5:1 bracket, which is what makes realised reward:risk converge on nominal.",
+    "locked_floor_formula": "(trail_activate_mult - atr_trail_mult) / atr_stop_mult, in units of R. Shipped: (2.75 - 1.75) / 1.5 = +0.67R. For a full +1.0R use arm 3.25 / trail 1.75, or arm 2.75 / trail 1.25.",
+    "payoff": "At the run-3 win rate of 34.12%, profit factor is realised_RR * 29/56: 1.04 at R:R 2.0 and 1.30 at R:R 2.5. Realised reward:risk is now the only metric that matters.",
+    "fee_compression": "Commission is a flat 0.15% of notional per round trip, subtracted from wins and added to losses, so it compresses the ratio itself: run 2's 1.761 gross reward:risk arrived as 1.279 net. Wider stops and targets enlarge the average trade and dilute this."
+  },
+  "params": {
+    "strategy_title": "Gemini Trend Guard",
+    "initial_capital": 10000,
+    "position_pct": 25,
+    "commission_pct": 0.075,
+
+    "use_risk_sizing": true,
+    "risk_per_trade_pct": 0.25,
+    "max_notional_pct": 50,
+
+    "ema_fast": 21,
+    "ema_slow": 55,
+    "allow_shorts": true,
+
+    "ema_macro": 200,
+    "use_macro_filter": true,
+    "adx_length": 14,
+    "adx_smoothing": 14,
+    "adx_min": 20,
+    "use_adx_filter": true,
+
+    "rsi_length": 14,
+    "rsi_floor": 50,
+    "rsi_ceiling": 50,
+
+    "atr_length": 14,
+    "atr_stop_mult": 1.5,
+    "atr_target_mult": 3.75,
+    "atr_trail_mult": 1.75,
+    "trail_activate_mult": 2.75,
+
+    "use_circuit_breaker": true,
+    "max_loss_streak": 4,
+    "breaker_cooldown_bars": 24,
+    "equity_lookback_bars": 500,
+    "max_rolling_drawdown_pct": 15.0
+  }
+}

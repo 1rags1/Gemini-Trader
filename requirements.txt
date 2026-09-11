@@ -1,0 +1,16 @@
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+pandas>=2.0
+ccxt>=4.2.0
+
+# pandas_ta only publishes pre-releases, so pip needs the explicit version.
+# 0.4.x is the NumPy 2 compatible line; the older 0.3.14b0 is no longer on PyPI.
+pandas_ta==0.4.71b0
+
+# Verifies TLS against the OS certificate store instead of the certifi bundle.
+# Required on machines where antivirus or a proxy intercepts HTTPS (see core/net.py).
+truststore>=0.10.0
+
+# Paper execution server (core/webhook_server.py).
+fastapi>=0.110
+uvicorn[standard]>=0.27
