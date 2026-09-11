@@ -21,12 +21,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.gemini_agent import Decision
+from core.config import TRADING_PAIRS
 from core.strategy_runner import (
     Position,
     RunnerState,
     StrategyRunner,
     apply_breaker,
+    count_open_positions,
     detect_signal,
+    fraction_qty,
     last_closed_ts,
     maybe_exit,
     position_qty,
@@ -137,11 +140,11 @@ def short_crossover_frame() -> pd.DataFrame:
 def runner_for(frame: pd.DataFrame, agent: StubAgent, tmp: Path, **kwargs) -> StrategyRunner:
     return StrategyRunner(
         agent=agent,
-        fetch_fn=lambda **_k: frame.copy(),
+        fetch_fn=kwargs.pop("fetch_fn", lambda **_k: frame.copy()),
         indicate_fn=lambda df: df,
         params=PARAMS,
         strategy_context="test",
-        symbol="BTC/USDT",
+        symbol=kwargs.pop("symbol", "BTC/USDT"),
         timeframe="1h",
         exchange_id="kraken",
         min_confidence=0.6,
@@ -149,6 +152,8 @@ def runner_for(frame: pd.DataFrame, agent: StubAgent, tmp: Path, **kwargs) -> St
         trade_log=tmp / "paper_trades.csv",
         reject_log=tmp / "rejected_alerts.csv",
         state_path=tmp / "runner.json",
+        pairs=kwargs.pop("pairs", ("BTC/USDT",)),
+        fetch_delay=kwargs.pop("fetch_delay", 0),
         **kwargs,
     )
 
@@ -271,6 +276,7 @@ def test_risk_sizing_is_capped() -> None:
     qty = position_qty(10_000, price=10000, atr=100, params=PARAMS)
     # 0.25% of 10k = 25 risk / (1.5*100) = 0.1667 BTC; 50% notional cap = 0.5 BTC
     assert abs(qty - 25 / 150) < 1e-9
+    assert abs(fraction_qty(10_000, 10000, 0.33) - 0.33) < 1e-9
     print(f"    qty={qty:.4f}")
 
 
@@ -381,6 +387,44 @@ def test_once_consults_gemini_without_signal() -> None:
     print("    --once consulted Gemini on a flat bar")
 
 
+def test_multi_pair_scan_caps_opens_and_sizes() -> None:
+    tmp = tmpdir()
+    fetched: list[str] = []
+    frame = long_crossover_frame()
+
+    def fetch(*, symbol: str, **_k):
+        fetched.append(symbol)
+        return frame.copy()
+
+    agent = StubAgent("BUY", 0.9, stop=9850, target=10375)
+    runner = runner_for(
+        frame,
+        agent,
+        tmp,
+        fetch_fn=fetch,
+        pairs=TRADING_PAIRS,
+        fetch_delay=0,
+    )
+    report = runner.cycle(now=NOW)
+    assert fetched == list(TRADING_PAIRS)
+    assert len(report.legs) == 3
+    assert report.book["BTC/USDT"] == "LONG"
+    assert report.book["ETH/USDT"] == "LONG"
+    assert report.book["SOL/USDT"] == "FLAT"
+    assert count_open_positions(runner.state.positions) == 2
+    sol = next(leg for leg in report.legs if leg.symbol == "SOL/USDT")
+    assert sol.reason == "max_open_positions"
+    assert sol.signal == "BUY"
+    btc_qty = runner.state.positions["BTC/USDT"]["qty"]
+    assert abs(btc_qty - 0.33) < 1e-9
+    saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
+    assert saved["positions"]["BTC/USDT"]["status"] == "LONG"
+    assert saved["positions"]["ETH/USDT"]["status"] == "LONG"
+    assert saved["positions"]["SOL/USDT"]["status"] == "FLAT"
+    assert agent.calls == 2
+    print("    scanned 3 pairs, opened 2, sized 33%")
+
+
 def test_breaker_blocks_entry() -> None:
     tmp = tmpdir()
     agent = StubAgent("BUY", 0.9, stop=9850, target=10375)
@@ -410,6 +454,7 @@ def main() -> int:
         ("low confidence rejected", test_low_confidence_rejected),
         ("stop closes position", test_open_position_closes_on_stop),
         ("--once consults without signal", test_once_consults_gemini_without_signal),
+        ("multi-pair scan + cap", test_multi_pair_scan_caps_opens_and_sizes),
         ("breaker blocks entry", test_breaker_blocks_entry),
     ]
     failures = 0

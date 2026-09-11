@@ -1,8 +1,8 @@
-"""Read-only localhost dashboard for the paper-trading runner.
+"""Read-only dashboard for the paper-trading runner.
 
-Serves a single Tailwind page on :8050 and a JSON snapshot the browser polls
-every 10 seconds. File reads are short-lived and shared, so this process never
-locks `state/runner.json` or `data/paper_trades.csv` away from the runner.
+Serves a single Tailwind page on 0.0.0.0:8050 and a JSON snapshot the browser
+polls every 10 seconds. File reads are short-lived and shared, so this process
+never locks `state/runner.json` or `data/paper_trades.csv` away from the runner.
 
     python -m core.dashboard
 """
@@ -29,16 +29,24 @@ if __package__ in (None, ""):
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
-from core.config import PROJECT_ROOT, get_settings
+from core.config import (
+    MAX_OPEN_POSITIONS,
+    PROJECT_ROOT,
+    TRADING_PAIRS,
+    get_settings,
+    migrate_position_book,
+)
 from core.market_data import add_indicators, fetch_ohlcv, latest_snapshot
 from core.net import enable_os_trust_store
 
 log = logging.getLogger("dashboard")
 
+DASHBOARD_HOST = "0.0.0.0"
 DASHBOARD_PORT = 8050
 TRADE_LIMIT = 15
 MARKET_CACHE_TTL = 20.0
 MARKET_CANDLES = 300
+MARKET_FETCH_DELAY = 1.0
 
 _FILL_RE = re.compile(r"fill=([-\d.]+)")
 _ENTRY_RE = re.compile(r"entry=([-\d.]+)")
@@ -107,9 +115,52 @@ def _paths() -> dict[str, Path]:
     }
 
 
-def read_runner_state() -> dict[str, Any]:
-    path = _paths()["state"]
-    empty = {
+def _pairs() -> tuple[str, ...]:
+    cfg = _cfg()
+    if cfg is not None and getattr(cfg, "trading_pairs", None):
+        return tuple(cfg.trading_pairs)
+    return TRADING_PAIRS
+
+
+def _max_open() -> int:
+    cfg = _cfg()
+    if cfg is not None and getattr(cfg, "max_open_positions", None):
+        return int(cfg.max_open_positions)
+    return MAX_OPEN_POSITIONS
+
+
+def _slot_status(slot: dict[str, Any] | None) -> str:
+    if not isinstance(slot, dict):
+        return "FLAT"
+    return str(slot.get("status") or slot.get("side") or "FLAT").upper() or "FLAT"
+
+
+def _position_cards(
+    book: dict[str, dict[str, Any]],
+    last_bars: dict[str, Any],
+    pairs: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for symbol in pairs:
+        slot = book.get(symbol) if isinstance(book, dict) else None
+        status = _slot_status(slot)
+        open_slot = dict(slot) if isinstance(slot, dict) and status not in {"", "FLAT"} else None
+        if open_slot is not None:
+            open_slot.setdefault("side", status)
+        cards.append(
+            {
+                "symbol": symbol,
+                "status": status if status not in {"", "FLAT"} else "FLAT",
+                "position": open_slot,
+                "last_bar": last_bars.get(symbol),
+            }
+        )
+    return cards
+
+
+def _empty_state(*, error: str | None = None) -> dict[str, Any]:
+    pairs = _pairs()
+    empty: dict[str, Any] = {
         "exists": False,
         "equity": None,
         "starting_equity": None,
@@ -119,16 +170,27 @@ def read_runner_state() -> dict[str, Any]:
         "breaker_active": False,
         "breaker_bars": 0,
         "last_bar": None,
+        "last_bars": {},
         "position_side": "FLAT",
         "position": None,
+        "positions": _position_cards({}, {}, pairs),
+        "open_count": 0,
+        "max_open_positions": _max_open(),
     }
+    if error:
+        empty["error"] = error
+    return empty
+
+
+def read_runner_state() -> dict[str, Any]:
+    path = _paths()["state"]
     if not path.exists():
-        return empty
+        return _empty_state()
     try:
         raw = json.loads(_read_shared(path))
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("state unreadable: %s", exc)
-        return {**empty, "error": str(exc)}
+        return _empty_state(error=str(exc))
 
     cfg = _cfg()
     starting = float(cfg.paper_starting_balance) if cfg is not None else 10_000.0
@@ -138,10 +200,13 @@ def read_runner_state() -> dict[str, Any]:
     except (TypeError, ValueError):
         equity_f = None
     pnl = None if equity_f is None else equity_f - starting
-    pos = raw.get("position")
-    side = "FLAT"
-    if isinstance(pos, dict) and pos.get("side"):
-        side = str(pos["side"]).upper()
+
+    pairs = _pairs()
+    book = migrate_position_book(raw if isinstance(raw, dict) else {}, pairs)
+    last_bars = dict(raw.get("last_bars") or {})
+    cards = _position_cards(book, last_bars, pairs)
+    first_open = next((card["position"] for card in cards if card["position"] is not None), None)
+    side = "FLAT" if first_open is None else str(first_open.get("side") or first_open.get("status") or "FLAT").upper()
 
     return {
         "exists": True,
@@ -153,8 +218,12 @@ def read_runner_state() -> dict[str, Any]:
         "breaker_active": bool(raw.get("breaker_active")),
         "breaker_bars": int(raw.get("breaker_bars") or 0),
         "last_bar": raw.get("last_bar"),
+        "last_bars": last_bars,
         "position_side": side,
-        "position": pos if isinstance(pos, dict) else None,
+        "position": first_open,
+        "positions": cards,
+        "open_count": sum(1 for card in cards if card["status"] != "FLAT"),
+        "max_open_positions": _max_open(),
     }
 
 
@@ -246,19 +315,7 @@ def read_reject_count() -> int:
         return 0
 
 
-def fetch_market() -> dict[str, Any]:
-    """Latest BTC snapshot, cached so a 10s browser poll does not hammer Kraken."""
-    now = time.monotonic()
-    with _market_lock:
-        age = now - float(_market_cache["fetched_at"])
-        if _market_cache["payload"] is not None and age < MARKET_CACHE_TTL:
-            return _market_cache["payload"]
-
-    cfg = _cfg()
-    symbol = cfg.symbol if cfg is not None else "BTC/USDT"
-    timeframe = cfg.timeframe if cfg is not None else "1h"
-    exchange = cfg.exchange_id if cfg is not None else "kraken"
-
+def _pair_metrics(symbol: str, timeframe: str, exchange: str) -> dict[str, Any]:
     try:
         enable_os_trust_store()
         frame = add_indicators(
@@ -266,11 +323,10 @@ def fetch_market() -> dict[str, Any]:
         )
         snap = latest_snapshot(frame)
         indicators = snap.get("indicators") or {}
-        payload = {
+        return {
             "ok": True,
             "symbol": snap.get("symbol") or symbol,
             "timeframe": snap.get("timeframe") or timeframe,
-            "exchange": exchange,
             "as_of": snap.get("as_of"),
             "last_close": snap.get("last_close"),
             "regime": snap.get("regime") or {},
@@ -283,12 +339,11 @@ def fetch_market() -> dict[str, Any]:
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001
-        log.warning("market fetch failed: %s", exc)
-        payload = {
+        log.warning("market fetch failed for %s: %s", symbol, exc)
+        return {
             "ok": False,
             "symbol": symbol,
             "timeframe": timeframe,
-            "exchange": exchange,
             "as_of": None,
             "last_close": None,
             "regime": {},
@@ -300,6 +355,36 @@ def fetch_market() -> dict[str, Any]:
             "atr": None,
             "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def fetch_market() -> dict[str, Any]:
+    """Latest snapshot per pair, cached so a 10s poll does not hammer Kraken."""
+    now = time.monotonic()
+    with _market_lock:
+        age = now - float(_market_cache["fetched_at"])
+        if _market_cache["payload"] is not None and age < MARKET_CACHE_TTL:
+            return _market_cache["payload"]
+
+    cfg = _cfg()
+    pairs = _pairs()
+    timeframe = cfg.timeframe if cfg is not None else "1h"
+    exchange = cfg.exchange_id if cfg is not None else "kraken"
+
+    rows: list[dict[str, Any]] = []
+    for index, symbol in enumerate(pairs):
+        if index > 0 and MARKET_FETCH_DELAY > 0:
+            time.sleep(MARKET_FETCH_DELAY)
+        rows.append(_pair_metrics(symbol, timeframe, exchange))
+
+    errors = [row["error"] for row in rows if row.get("error")]
+    payload = {
+        "ok": any(row.get("ok") for row in rows),
+        "timeframe": timeframe,
+        "exchange": exchange,
+        "as_of": next((row.get("as_of") for row in rows if row.get("as_of")), None),
+        "pairs": rows,
+        "error": None if not errors else errors[0],
+    }
 
     with _market_lock:
         _market_cache["fetched_at"] = time.monotonic()
@@ -360,21 +445,18 @@ PAGE = r"""<!DOCTYPE html>
       </div>
     </header>
 
-    <section class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
-      <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p class="text-xs uppercase tracking-wider text-slate-400">Position</p>
-        <p id="pos-side" class="text-3xl font-semibold mt-1">—</p>
-        <p id="pos-detail" class="text-xs text-slate-400 mt-2 leading-relaxed">No open position</p>
-      </article>
+    <section id="pair-cards" class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4"></section>
+
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
       <article class="bg-panel rounded-xl border border-white/5 p-4">
         <p class="text-xs uppercase tracking-wider text-slate-400">Paper equity</p>
         <p id="equity" class="text-3xl font-semibold mt-1 mono">—</p>
         <p id="pnl" class="text-sm mt-2">—</p>
       </article>
       <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p class="text-xs uppercase tracking-wider text-slate-400">Regime</p>
-        <p id="regime" class="text-3xl font-semibold mt-1">—</p>
-        <p id="regime-detail" class="text-xs text-slate-400 mt-2 leading-relaxed">Waiting for candles</p>
+        <p class="text-xs uppercase tracking-wider text-slate-400">Open slots</p>
+        <p id="slots" class="text-3xl font-semibold mt-1 mono">—</p>
+        <p id="slots-detail" class="text-xs text-slate-400 mt-2">Waiting for book</p>
       </article>
       <article class="bg-panel rounded-xl border border-white/5 p-4">
         <p class="text-xs uppercase tracking-wider text-slate-400">Circuit breaker</p>
@@ -383,19 +465,27 @@ PAGE = r"""<!DOCTYPE html>
       </article>
     </section>
 
-    <section class="bg-panel rounded-xl border border-white/5 p-4 mb-4">
+    <section class="bg-panel rounded-xl border border-white/5 p-4 mb-4 overflow-hidden">
       <div class="flex items-baseline justify-between mb-3">
-        <h2 class="text-sm uppercase tracking-wider text-slate-400">Live BTC / USDT</h2>
+        <h2 class="text-sm uppercase tracking-wider text-slate-400">Live metrics</h2>
         <p id="mkt-meta" class="text-xs text-slate-500 mono"></p>
       </div>
       <p id="mkt-error" class="hidden text-sm text-rose-300 mb-3"></p>
-      <div class="grid grid-cols-2 md:grid-cols-6 gap-3">
-        <div><p class="text-xs text-slate-500">Close</p><p id="ind-close" class="mono text-lg">—</p></div>
-        <div><p class="text-xs text-slate-500">EMA 21</p><p id="ind-fast" class="mono text-lg">—</p></div>
-        <div><p class="text-xs text-slate-500">EMA 55</p><p id="ind-slow" class="mono text-lg">—</p></div>
-        <div><p class="text-xs text-slate-500">EMA 200</p><p id="ind-macro" class="mono text-lg">—</p></div>
-        <div><p class="text-xs text-slate-500">RSI 14</p><p id="ind-rsi" class="mono text-lg">—</p></div>
-        <div><p class="text-xs text-slate-500">ADX 14</p><p id="ind-adx" class="mono text-lg">—</p></div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-left text-xs uppercase tracking-wider text-slate-500">
+            <tr>
+              <th class="pr-4 py-2 font-medium">Pair</th>
+              <th class="px-3 py-2 font-medium text-right">Close</th>
+              <th class="px-3 py-2 font-medium text-right">EMA 21</th>
+              <th class="px-3 py-2 font-medium text-right">EMA 55</th>
+              <th class="px-3 py-2 font-medium text-right">EMA 200</th>
+              <th class="px-3 py-2 font-medium text-right">RSI</th>
+              <th class="px-3 py-2 font-medium text-right">ADX</th>
+            </tr>
+          </thead>
+          <tbody id="metrics" class="divide-y divide-white/5"></tbody>
+        </table>
       </div>
     </section>
 
@@ -409,6 +499,7 @@ PAGE = r"""<!DOCTYPE html>
           <thead class="text-left text-xs uppercase tracking-wider text-slate-500">
             <tr>
               <th class="px-4 py-2 font-medium">Time</th>
+              <th class="px-4 py-2 font-medium">Symbol</th>
               <th class="px-4 py-2 font-medium">Action</th>
               <th class="px-4 py-2 font-medium">Verdict</th>
               <th class="px-4 py-2 font-medium text-right">Entry</th>
@@ -438,16 +529,24 @@ PAGE = r"""<!DOCTYPE html>
       return `<span class="inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ring-1 ${map[tone]||map.slate}">${label}</span>`;
     };
 
+    const px = (n) => n == null || Number.isNaN(n) ? "—" : fmt(n, Number(n) >= 1000 ? 1 : Number(n) >= 100 ? 2 : 3);
+
     function render(data) {
       const s = data.state || {};
       const m = data.market || {};
-      const side = s.position_side || "FLAT";
-      document.getElementById("pos-side").textContent = side;
-      document.getElementById("pos-side").className = "text-3xl font-semibold mt-1 " + tonePos(side);
-      const p = s.position;
-      document.getElementById("pos-detail").textContent = p
-        ? `Entry ${fmt(p.entry_price, 1)} · stop ${fmt(p.trail_stop || p.stop, 1)} · target ${fmt(p.target, 1)}${p.trail_armed ? " · trail armed" : ""}`
-        : (s.last_bar ? `Last closed bar ${s.last_bar}` : "No open position");
+      const cards = s.positions || [];
+      document.getElementById("pair-cards").innerHTML = cards.map(card => {
+        const side = card.status || "FLAT";
+        const p = card.position;
+        const detail = p
+          ? `Entry ${px(p.entry_price)} · stop ${px(p.trail_stop || p.stop)} · target ${px(p.target)}${p.trail_armed ? " · trail armed" : ""}`
+          : (card.last_bar ? `Last closed bar ${card.last_bar}` : "No open position");
+        return `<article class="bg-panel rounded-xl border border-white/5 p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">${card.symbol || "—"}</p>
+          <p class="text-3xl font-semibold mt-1 ${tonePos(side)}">${side}</p>
+          <p class="text-xs text-slate-400 mt-2 leading-relaxed">${detail}</p>
+        </article>`;
+      }).join("") || `<article class="bg-panel rounded-xl border border-white/5 p-4 md:col-span-3"><p class="text-sm text-slate-500">No position book</p></article>`;
 
       document.getElementById("equity").textContent = s.equity == null ? "—" : fmt(s.equity, 2);
       const pnl = s.pnl;
@@ -459,34 +558,46 @@ PAGE = r"""<!DOCTYPE html>
         pnlEl.className = "text-sm mt-2 " + (pnl >= 0 ? "text-teal-300" : "text-rose-300");
       }
 
-      const reg = m.regime || {};
-      const dir = reg.tradeable_direction || "unknown";
-      document.getElementById("regime").textContent = (reg.macro_trend || "—").toUpperCase();
-      document.getElementById("regime").className = "text-3xl font-semibold mt-1 " + (reg.macro_trend === "bull" ? "text-teal-300" : reg.macro_trend === "bear" ? "text-rose-300" : "text-slate-200");
-      document.getElementById("regime-detail").textContent =
-        `${reg.trend_strength || "—"} · ADX ${fmt(reg.adx, 1)} · EMA200 ${fmt(reg.macro_ema, 1)} · ${fmt(reg.price_vs_macro_ema_pct, 2)}% vs macro · ${dir.replaceAll("_", " ")}`;
+      const openCount = s.open_count || 0;
+      const maxOpen = s.max_open_positions || 0;
+      document.getElementById("slots").textContent = maxOpen ? `${openCount} / ${maxOpen}` : String(openCount);
+      document.getElementById("slots-detail").textContent = openCount
+        ? cards.filter(c => c.status && c.status !== "FLAT").map(c => `${c.symbol} ${c.status}`).join(" · ")
+        : "All pairs flat";
 
       document.getElementById("breaker").textContent = s.breaker_active ? "ON" : "off";
       document.getElementById("breaker").className = "text-3xl font-semibold mt-1 " + (s.breaker_active ? "text-rose-300" : "text-teal-300");
       document.getElementById("breaker-detail").textContent = `Loss streak ${s.loss_streak || 0}` + (s.breaker_active ? ` · cooldown ${s.breaker_bars || 0} bars` : "");
 
-      document.getElementById("ind-close").textContent = fmt(m.last_close, 1);
-      document.getElementById("ind-fast").textContent = fmt(m.ema_fast, 1);
-      document.getElementById("ind-slow").textContent = fmt(m.ema_slow, 1);
-      document.getElementById("ind-macro").textContent = fmt(m.ema_macro, 1);
-      document.getElementById("ind-rsi").textContent = fmt(m.rsi, 1);
-      document.getElementById("ind-adx").textContent = fmt(m.adx, 1);
+      const pairRows = m.pairs || [];
       document.getElementById("mkt-meta").textContent = [m.exchange, m.timeframe, m.as_of || ""].filter(Boolean).join(" · ");
       const err = document.getElementById("mkt-error");
       if (m.error) { err.textContent = m.error; err.classList.remove("hidden"); }
       else { err.classList.add("hidden"); }
+      const metrics = document.getElementById("metrics");
+      if (!pairRows.length) {
+        metrics.innerHTML = `<tr><td colspan="7" class="py-6 text-center text-slate-500">Waiting for candles</td></tr>`;
+      } else {
+        metrics.innerHTML = pairRows.map(row => {
+          const errNote = row.error ? `<div class="text-[11px] text-rose-300 mt-1">${row.error}</div>` : "";
+          return `<tr class="hover:bg-white/[0.02]">
+            <td class="pr-4 py-2.5 font-medium text-slate-200 whitespace-nowrap">${row.symbol || "—"}${errNote}</td>
+            <td class="px-3 py-2.5 mono text-right">${px(row.last_close)}</td>
+            <td class="px-3 py-2.5 mono text-right">${px(row.ema_fast)}</td>
+            <td class="px-3 py-2.5 mono text-right">${px(row.ema_slow)}</td>
+            <td class="px-3 py-2.5 mono text-right">${px(row.ema_macro)}</td>
+            <td class="px-3 py-2.5 mono text-right">${fmt(row.rsi, 1)}</td>
+            <td class="px-3 py-2.5 mono text-right">${fmt(row.adx, 1)}</td>
+          </tr>`;
+        }).join("");
+      }
 
       const body = document.getElementById("trades");
       const rows = (data.trades && data.trades.trades) || [];
       document.getElementById("trade-meta").textContent =
         `${data.trades && data.trades.count || 0} fills · ${data.rejects || 0} rejects · showing ${rows.length}`;
       if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">No paper trades yet</td></tr>`;
+        body.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">No paper trades yet</td></tr>`;
       } else {
         body.innerHTML = rows.map(t => {
           const verdictTone = t.verdict === "REJECTED" || t.hit === "stop" ? "red" : (t.tone || "slate");
@@ -494,6 +605,7 @@ PAGE = r"""<!DOCTYPE html>
           const rationale = (t.rationale || t.alert_reason || "—").slice(0, 160);
           return `<tr class="hover:bg-white/[0.02]">
             <td class="px-4 py-2.5 mono text-xs text-slate-400 whitespace-nowrap">${(t.timestamp||"").replace("T"," ").replace("+00:00"," UTC")}</td>
+            <td class="px-4 py-2.5 mono text-xs text-slate-200 whitespace-nowrap">${t.symbol || "—"}</td>
             <td class="px-4 py-2.5">${badge(actionTone, t.action || "—")}</td>
             <td class="px-4 py-2.5">${badge(verdictTone, t.verdict || "—")}${t.hit ? " " + badge(t.hit === "stop" ? "red" : "green", t.hit === "stop" ? "STOP_LOSS" : "PROFIT") : ""}</td>
             <td class="px-4 py-2.5 mono text-right">${fmt(t.entry_price, 1)}</td>
@@ -552,7 +664,7 @@ def snapshot(request: Request, token: str | None = Query(default=None)) -> dict[
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="Read-only paper-trading dashboard")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=DASHBOARD_HOST)
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT)
     args = parser.parse_args(argv)
 

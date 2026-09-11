@@ -37,6 +37,17 @@ DEFAULT_EXCHANGE = "kraken"
 #: SDK expects). Bounds a stalled request so a trading loop cannot hang.
 DEFAULT_TIMEOUT_MS = 20_000
 
+#: Universe the runner scans each cycle. Override with TRADING_PAIRS in .env
+#: as a comma-separated list.
+TRADING_PAIRS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+
+#: Hard cap on concurrent paper positions so three simultaneous signals cannot
+#: put the whole book on at once.
+MAX_OPEN_POSITIONS = 2
+
+#: Fraction of current equity allocated to each new fill (~33% per slot).
+POSITION_SIZE_FRACTION = 0.33
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -46,6 +57,9 @@ class Settings:
     gemini_fallback_models: tuple[str, ...] = DEFAULT_FALLBACK_MODELS
     exchange_id: str = DEFAULT_EXCHANGE
     symbol: str = "BTC/USDT"
+    trading_pairs: tuple[str, ...] = TRADING_PAIRS
+    max_open_positions: int = MAX_OPEN_POSITIONS
+    position_size_fraction: float = POSITION_SIZE_FRACTION
     timeframe: str = "1h"
     candle_limit: int = 500
     paper_starting_balance: float = 10_000.0
@@ -69,6 +83,47 @@ class Settings:
         if len(self.gemini_api_key) <= 8:
             return "*" * len(self.gemini_api_key)
         return f"{self.gemini_api_key[:4]}...{self.gemini_api_key[-4:]}"
+
+
+def empty_position_book(pairs: tuple[str, ...] | None = None) -> dict[str, dict]:
+    """FLAT slot for every configured pair."""
+    return {symbol: {"status": "FLAT"} for symbol in (pairs or TRADING_PAIRS)}
+
+
+def migrate_position_book(raw: dict, pairs: tuple[str, ...] | None = None) -> dict[str, dict]:
+    """Build a per-symbol book from either the new or the legacy state file.
+
+    Legacy files stored a single `position` object (or null). Equity and the
+    other scalar fields are left untouched; this only reshapes the book.
+    """
+    pairs = pairs or TRADING_PAIRS
+    book = empty_position_book(pairs)
+    incoming = raw.get("positions")
+    if isinstance(incoming, dict):
+        for symbol, slot in incoming.items():
+            if isinstance(slot, dict):
+                book[symbol] = dict(slot)
+                book[symbol].setdefault(
+                    "status",
+                    str(slot.get("side") or slot.get("status") or "FLAT").upper(),
+                )
+
+    legacy = raw.get("position")
+    if isinstance(legacy, dict):
+        status = str(legacy.get("status") or legacy.get("side") or "FLAT").upper()
+        if status not in {"", "FLAT"}:
+            symbol = legacy.get("symbol") or (pairs[0] if pairs else "BTC/USDT")
+            book[symbol] = {**legacy, "status": status, "symbol": symbol}
+    return book
+
+
+def legacy_open_slot(positions: dict[str, dict]) -> dict | None:
+    """First non-FLAT slot, for code that still reads a single `position`."""
+    for slot in positions.values():
+        status = str(slot.get("status") or slot.get("side") or "FLAT").upper()
+        if status not in {"", "FLAT"}:
+            return slot
+    return None
 
 
 def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -96,6 +151,11 @@ def get_settings() -> Settings:
         gemini_fallback_models=_csv_env("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS),
         exchange_id=os.getenv("EXCHANGE_ID", DEFAULT_EXCHANGE),
         symbol=os.getenv("SYMBOL", "BTC/USDT"),
+        trading_pairs=_csv_env("TRADING_PAIRS", TRADING_PAIRS),
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", str(MAX_OPEN_POSITIONS))),
+        position_size_fraction=float(
+            os.getenv("POSITION_SIZE_FRACTION", str(POSITION_SIZE_FRACTION))
+        ),
         timeframe=os.getenv("TIMEFRAME", "1h"),
         candle_limit=int(os.getenv("CANDLE_LIMIT", "500")),
         paper_starting_balance=float(os.getenv("PAPER_STARTING_BALANCE", "10000")),

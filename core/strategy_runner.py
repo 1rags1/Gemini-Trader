@@ -17,7 +17,7 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -27,7 +27,15 @@ import pandas as pd
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.config import get_settings
+from core.config import (
+    MAX_OPEN_POSITIONS,
+    POSITION_SIZE_FRACTION,
+    TRADING_PAIRS,
+    empty_position_book,
+    get_settings,
+    legacy_open_slot,
+    migrate_position_book,
+)
 from core.gemini_agent import Decision, GeminiAgent
 from core.market_data import add_indicators, fetch_ohlcv, latest_snapshot
 from strategies import load_strategy
@@ -101,6 +109,11 @@ class RunnerState:
     breaker_active: bool = False
     breaker_bars: int = 0
     last_bar: str | None = None
+    #: Per-symbol book. Each value is at least {"status": "FLAT"|"LONG"|"SHORT"}.
+    positions: dict[str, dict[str, Any]] = field(default_factory=empty_position_book)
+    #: Closed-bar timestamp last processed per symbol (ISO).
+    last_bars: dict[str, str] = field(default_factory=dict)
+    #: Legacy single-slot mirror. None means the book is flat.
     position: dict[str, Any] | None = None
 
 
@@ -128,6 +141,8 @@ class CycleReport:
     target: float | None = None
     logged_to: str | None = None
     equity: float | None = None
+    legs: list["CycleReport"] = field(default_factory=list)
+    book: dict[str, str] = field(default_factory=dict)
 
 
 def timeframe_delta(timeframe: str) -> pd.Timedelta:
@@ -348,9 +363,42 @@ def append_row(path: Path, row: dict[str, Any]) -> None:
 
 
 def _position_from_dict(raw: dict[str, Any] | None) -> Position | None:
+    """Rehydrate a Position, ignoring book-only keys like status/symbol."""
     if not raw:
         return None
-    return Position(**raw)
+    status = str(raw.get("status") or raw.get("side") or "FLAT").upper()
+    if status in {"", "FLAT"}:
+        return None
+    payload = dict(raw)
+    payload.setdefault("side", status)
+    allowed = {item.name for item in fields(Position)}
+    try:
+        return Position(**{key: payload[key] for key in allowed if key in payload})
+    except TypeError:
+        return None
+
+
+def count_open_positions(positions: dict[str, dict[str, Any]]) -> int:
+    n = 0
+    for slot in positions.values():
+        status = str(slot.get("status") or slot.get("side") or "FLAT").upper()
+        if status not in {"", "FLAT"}:
+            n += 1
+    return n
+
+
+def fraction_qty(equity: float, price: float, fraction: float) -> float:
+    """Notional = fraction * equity. Used instead of ATR risk sizing for the book."""
+    if price <= 0 or fraction <= 0 or equity <= 0:
+        return 0.0
+    return equity * fraction / price
+
+
+def _book_status(positions: dict[str, dict[str, Any]]) -> dict[str, str]:
+    return {
+        symbol: str(slot.get("status") or slot.get("side") or "FLAT").upper()
+        for symbol, slot in positions.items()
+    }
 
 
 def _bar_ts(bar: pd.Series) -> str:
@@ -378,6 +426,8 @@ class StrategyRunner:
         trade_log: Path | None = None,
         reject_log: Path | None = None,
         state_path: Path | None = None,
+        pairs: tuple[str, ...] | None = None,
+        fetch_delay: float | None = None,
     ) -> None:
         self._settings = None
         self.fetch_fn = fetch_fn or fetch_ohlcv
@@ -388,6 +438,17 @@ class StrategyRunner:
         self._strategy_context = strategy_context
 
         self.symbol = symbol if symbol is not None else self.settings.symbol
+        if pairs is not None:
+            self.pairs = tuple(pairs)
+            self.max_open_positions = MAX_OPEN_POSITIONS
+            self.position_size_fraction = POSITION_SIZE_FRACTION
+        else:
+            self.pairs = tuple(self.settings.trading_pairs or TRADING_PAIRS)
+            self.max_open_positions = int(self.settings.max_open_positions or MAX_OPEN_POSITIONS)
+            self.position_size_fraction = float(
+                self.settings.position_size_fraction or POSITION_SIZE_FRACTION
+            )
+        self.fetch_delay = 1.0 if fetch_delay is None else max(0.0, float(fetch_delay))
         self.timeframe = timeframe if timeframe is not None else self.settings.timeframe
         self.exchange_id = exchange_id if exchange_id is not None else self.settings.exchange_id
         self.min_confidence = (
@@ -426,9 +487,24 @@ class StrategyRunner:
             self._agent = GeminiAgent()
         return self._agent
 
+    def _fetch_pair(self, symbol: str) -> pd.DataFrame:
+        return self.indicate_fn(
+            self.fetch_fn(
+                symbol=symbol,
+                timeframe=self.timeframe,
+                limit=self.candle_limit,
+                exchange_id=self.exchange_id,
+            )
+        )
+
     def _load_state(self) -> RunnerState:
+        pairs = self.pairs
         if self.state_path.exists():
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            positions = migrate_position_book(raw, pairs)
+            last_bars = dict(raw.get("last_bars") or {})
+            if raw.get("last_bar") and not last_bars:
+                last_bars = {symbol: raw["last_bar"] for symbol in pairs}
             return RunnerState(
                 equity=float(raw.get("equity", self.starting_equity)),
                 equity_history=list(raw.get("equity_history") or []),
@@ -436,21 +512,33 @@ class StrategyRunner:
                 breaker_active=bool(raw.get("breaker_active") or False),
                 breaker_bars=int(raw.get("breaker_bars") or 0),
                 last_bar=raw.get("last_bar"),
-                position=raw.get("position"),
+                last_bars=last_bars,
+                positions=positions,
+                position=legacy_open_slot(positions),
             )
-        return RunnerState(equity=self.starting_equity)
+        return RunnerState(equity=self.starting_equity, positions=empty_position_book(pairs))
 
     def save_state(self) -> None:
+        if not self.state.positions:
+            self.state.positions = empty_position_book(self.pairs)
+        self.state.position = legacy_open_slot(self.state.positions)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(asdict(self.state), indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
 
-    def _base_row(self, action: str, price: float | None, signal: Signal | None, extra: dict[str, Any]) -> dict[str, Any]:
+    def _base_row(
+        self,
+        action: str,
+        price: float | None,
+        signal: Signal | None,
+        extra: dict[str, Any],
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return {
             "timestamp": now,
-            "symbol": self.symbol,
+            "symbol": symbol or self.symbol,
             "action": action,
             "entry_price": price,
             "stop_loss": extra.get("stop_loss", signal.stop if signal else ""),
@@ -466,11 +554,12 @@ class StrategyRunner:
             "rationale": extra.get("rationale", ""),
         }
 
-    def _close_position(self, position: Position, exit_event: Exit, bar: pd.Series) -> str:
+    def _close_position(self, symbol: str, position: Position, exit_event: Exit, bar: pd.Series) -> str:
         pnl = close_pnl(position, exit_event.price, float(self.params.get("commission_pct", 0.075)))
         self.state.equity += pnl
         self.state.loss_streak = self.state.loss_streak + 1 if pnl < 0 else 0
-        self.state.position = None
+        self.state.positions[symbol] = {"status": "FLAT"}
+        self.state.position = legacy_open_slot(self.state.positions)
         adx = bar["adx"] if "adx" in bar.index else None
         macro = bar["ema_macro"] if "ema_macro" in bar.index else None
         append_row(
@@ -491,14 +580,15 @@ class StrategyRunner:
                         f"fill={exit_event.price:.4f} pnl={pnl:.2f} hit={exit_event.hit}"
                     ),
                 },
+                symbol=symbol,
             ),
         )
         return str(self.trade_log)
 
-    def _open_position(self, signal: Signal, decision: Decision, opened_bar: str) -> Position:
+    def _open_position(self, symbol: str, signal: Signal, decision: Decision, opened_bar: str) -> Position:
         stop = decision.stop_loss if decision.stop_loss is not None else signal.stop
         target = decision.take_profit if decision.take_profit is not None else signal.target
-        qty = position_qty(self.state.equity, signal.price, signal.atr, self.params)
+        qty = fraction_qty(self.state.equity, signal.price, self.position_size_fraction)
         side: Literal["LONG", "SHORT"] = "LONG" if signal.action == "BUY" else "SHORT"
         position = Position(
             side=side,
@@ -515,7 +605,8 @@ class StrategyRunner:
             rationale=decision.rationale,
             reason=signal.reason,
         )
-        self.state.position = asdict(position)
+        self.state.positions[symbol] = {**asdict(position), "status": side, "symbol": symbol}
+        self.state.position = legacy_open_slot(self.state.positions)
         return position
 
     def _confirm(self, signal: Signal, snapshot: dict[str, Any]) -> tuple[str, str, Decision | None]:
@@ -549,33 +640,54 @@ class StrategyRunner:
         return bars
 
     def cycle(self, *, consult_always: bool = False, now: pd.Timestamp | None = None) -> CycleReport:
-        frame = self.indicate_fn(
-            self.fetch_fn(
-                symbol=self.symbol,
-                timeframe=self.timeframe,
-                limit=self.candle_limit,
-                exchange_id=self.exchange_id,
+        """Evaluate every pair, manage exits, then open new slots up to the cap."""
+        if not self.state.positions:
+            self.state.positions = empty_position_book(self.pairs)
+        for symbol in self.pairs:
+            self.state.positions.setdefault(symbol, {"status": "FLAT"})
+
+        prepared: list[dict[str, Any]] = []
+        for index, symbol in enumerate(self.pairs):
+            if index > 0 and self.fetch_delay > 0:
+                time.sleep(self.fetch_delay)
+            frame = self._fetch_pair(symbol)
+            closed_ts = last_closed_ts(frame, self.timeframe, now=now)
+            closed = frame.loc[:closed_ts]
+            live = frame.iloc[-1]
+            last = closed.iloc[-1]
+            snapshot = latest_snapshot(closed)
+            snapshot["tradingview_alert"] = None
+            bar_iso = closed_ts.isoformat()
+            use_adx = bool(self.params.get("use_adx_filter", True))
+            adx_min = float(self.params.get("adx_min", 20))
+            prepared.append(
+                {
+                    "symbol": symbol,
+                    "closed_ts": closed_ts,
+                    "closed": closed,
+                    "live": live,
+                    "last": last,
+                    "snapshot": snapshot,
+                    "bar_iso": bar_iso,
+                    "new_bar": self.state.last_bars.get(symbol) != bar_iso,
+                    "trend_strong": (not use_adx)
+                    or (pd.notna(last.get("adx")) and float(last["adx"]) > adx_min),
+                    "signal": None,
+                    "position": _position_from_dict(self.state.positions.get(symbol)),
+                    "verdict": None,
+                    "reason": "flat_no_signal",
+                    "gemini": None,
+                    "logged": None,
+                }
             )
-        )
-        closed_ts = last_closed_ts(frame, self.timeframe, now=now)
-        closed = frame.loc[:closed_ts]
-        live = frame.iloc[-1]
-        last = closed.iloc[-1]
-        snapshot = latest_snapshot(closed)
-        snapshot["tradingview_alert"] = None
-        new_bar = self.state.last_bar != closed_ts.isoformat()
 
-        logged: str | None = None
-        verdict: str | None = None
-        reason = "flat_no_signal"
-        gemini: Decision | None = None
-        signal: Signal | None = None
-
-        position = _position_from_dict(self.state.position)
-        if position is not None:
+        for item in prepared:
+            position = item["position"]
+            if position is None:
+                continue
             exit_event = None
-            exit_bar = live
-            for bar in self._exit_bars(position, last, live):
+            exit_bar = item["live"]
+            for bar in self._exit_bars(position, item["last"], item["live"]):
                 atr = float(bar["atr"]) if pd.notna(bar.get("atr")) else position.entry_atr
                 exit_event = maybe_exit(
                     position,
@@ -585,40 +697,49 @@ class StrategyRunner:
                     atr=atr,
                     params=self.params,
                 )
-                self.state.position = asdict(position)
+                self.state.positions[item["symbol"]] = {
+                    **asdict(position),
+                    "status": position.side,
+                    "symbol": item["symbol"],
+                }
                 if exit_event is not None:
                     exit_bar = bar
                     break
             if exit_event is not None:
-                logged = self._close_position(position, exit_event, exit_bar)
-                position = None
-                verdict = "CONFIRMED"
-                reason = exit_event.reason
+                item["logged"] = self._close_position(item["symbol"], position, exit_event, exit_bar)
+                item["position"] = None
+                item["verdict"] = "CONFIRMED"
+                item["reason"] = exit_event.reason
             else:
-                reason = "holding"
+                item["reason"] = "holding"
 
-        use_adx = bool(self.params.get("use_adx_filter", True))
-        adx_min = float(self.params.get("adx_min", 20))
-        trend_strong = (not use_adx) or (
-            pd.notna(last.get("adx")) and float(last["adx"]) > adx_min
-        )
-        if new_bar:
+        any_new_bar = any(item["new_bar"] for item in prepared)
+        trend_strong = any(item["trend_strong"] for item in prepared)
+        if any_new_bar:
             self.state.equity_history.append(self.state.equity)
             lookback = int(self.params.get("equity_lookback_bars", 500))
             if len(self.state.equity_history) > lookback:
                 self.state.equity_history = self.state.equity_history[-lookback:]
-        apply_breaker(self.state, self.params, trend_strong, new_bar)
+        apply_breaker(self.state, self.params, trend_strong, any_new_bar)
 
-        if position is None:
-            signal = detect_signal(closed, self.params, self.state.breaker_active)
+        consulted = False
+        for item in prepared:
+            if item["position"] is not None:
+                continue
+            signal = detect_signal(item["closed"], self.params, self.state.breaker_active)
+            item["signal"] = signal
             if (
                 signal is None
                 and self.state.breaker_active
-                and detect_signal(closed, self.params, False) is not None
+                and detect_signal(item["closed"], self.params, False) is not None
             ):
-                reason = "circuit_breaker_active"
+                item["reason"] = "circuit_breaker_active"
 
-            if signal is not None and new_bar:
+            if signal is not None and item["new_bar"]:
+                if count_open_positions(self.state.positions) >= self.max_open_positions:
+                    item["reason"] = "max_open_positions"
+                    continue
+                snapshot = item["snapshot"]
                 snapshot["tradingview_alert"] = {
                     "action": signal.action,
                     "reason": signal.reason,
@@ -628,6 +749,10 @@ class StrategyRunner:
                     "breaker_active": self.state.breaker_active,
                 }
                 verdict, reason, gemini = self._confirm(signal, snapshot)
+                consulted = True
+                item["verdict"] = verdict
+                item["reason"] = reason
+                item["gemini"] = gemini
                 extra = {
                     "verdict": verdict,
                     "confidence": None if gemini is None else round(gemini.confidence, 4),
@@ -641,68 +766,107 @@ class StrategyRunner:
                     "take_profit": signal.target if gemini is None else (gemini.take_profit or signal.target),
                 }
                 if verdict == "CONFIRMED" and gemini is not None:
-                    position = self._open_position(signal, gemini, closed_ts.isoformat())
+                    position = self._open_position(item["symbol"], signal, gemini, item["bar_iso"])
+                    item["position"] = position
                     extra["stop_loss"] = position.stop
                     extra["take_profit"] = position.target
-                    append_row(self.trade_log, self._base_row(signal.action, signal.price, signal, extra))
-                    logged = str(self.trade_log)
+                    append_row(
+                        self.trade_log,
+                        self._base_row(
+                            signal.action, signal.price, signal, extra, symbol=item["symbol"]
+                        ),
+                    )
+                    item["logged"] = str(self.trade_log)
                 else:
-                    append_row(self.reject_log, self._base_row(signal.action, signal.price, signal, extra))
-                    logged = str(self.reject_log)
+                    append_row(
+                        self.reject_log,
+                        self._base_row(
+                            signal.action, signal.price, signal, extra, symbol=item["symbol"]
+                        ),
+                    )
+                    item["logged"] = str(self.reject_log)
             elif signal is not None:
-                reason = "signal_already_processed"
+                item["reason"] = "signal_already_processed"
 
-        if consult_always and gemini is None:
+        consult_gemini: Decision | None = next(
+            (item["gemini"] for item in prepared if item["gemini"] is not None), None
+        )
+        if consult_always and not consulted:
+            snapshot = prepared[0]["snapshot"] if prepared else {}
             try:
-                gemini = self.get_agent().decide(snapshot, self.strategy_context())
-                if verdict is None:
-                    verdict = "HOLD"
-                if reason == "flat_no_signal":
-                    reason = "no_entry_signal"
+                consult_gemini = self.get_agent().decide(snapshot, self.strategy_context())
+                for item in prepared:
+                    if item["gemini"] is None:
+                        item["gemini"] = consult_gemini
+                    if item["verdict"] is None:
+                        item["verdict"] = "HOLD"
+                    if item["reason"] == "flat_no_signal":
+                        item["reason"] = "no_entry_signal"
             except Exception as exc:  # noqa: BLE001
                 log.error("agent unavailable on dry-run consult: %s", exc)
-                if verdict is None:
-                    verdict = "REJECTED"
-                    reason = "agent_unavailable"
+                for item in prepared:
+                    if item["verdict"] is None:
+                        item["verdict"] = "REJECTED"
+                        item["reason"] = "agent_unavailable"
 
-        if new_bar:
-            self.state.last_bar = closed_ts.isoformat()
+        latest_closed: pd.Timestamp | None = None
+        for item in prepared:
+            if item["new_bar"]:
+                self.state.last_bars[item["symbol"]] = item["bar_iso"]
+            if latest_closed is None or item["closed_ts"] > latest_closed:
+                latest_closed = item["closed_ts"]
+        if latest_closed is not None:
+            self.state.last_bar = latest_closed.isoformat()
         self.save_state()
 
-        pos_label = "FLAT" if position is None else position.side
+        legs = [self._leg_report(item) for item in prepared]
+        primary = next((leg for leg in legs if leg.symbol == self.symbol), legs[0] if legs else None)
+        if primary is None:
+            raise RuntimeError("cycle produced no pair reports")
+        primary.legs = legs
+        primary.book = _book_status(self.state.positions)
+        primary.equity = self.state.equity
+        primary.breaker_active = self.state.breaker_active
+        primary.loss_streak = self.state.loss_streak
+        return primary
+
+    def _leg_report(self, item: dict[str, Any]) -> CycleReport:
+        signal: Signal | None = item["signal"]
+        position: Position | None = item["position"]
+        gemini: Decision | None = item["gemini"]
+        last: pd.Series = item["last"]
+        snapshot: dict[str, Any] = item["snapshot"]
         return CycleReport(
-            symbol=self.symbol,
+            symbol=item["symbol"],
             timeframe=self.timeframe,
             exchange=self.exchange_id,
-            bar=closed_ts.isoformat(),
+            bar=item["bar_iso"],
             close=float(last["close"]),
-            new_bar=new_bar,
+            new_bar=item["new_bar"],
             signal=None if signal is None else signal.action,
             signal_reason=None if signal is None else signal.reason,
             regime=snapshot.get("regime") or {},
             breaker_active=self.state.breaker_active,
             loss_streak=self.state.loss_streak,
-            position=pos_label,
-            verdict=verdict,
-            reason=reason,
+            position="FLAT" if position is None else position.side,
+            verdict=item["verdict"],
+            reason=item["reason"],
             gemini_action=None if gemini is None else gemini.action,
             gemini_confidence=None if gemini is None else gemini.confidence,
             gemini_rationale=None if gemini is None else gemini.rationale,
             model=getattr(self._agent, "last_model_used", None),
             stop=None if position is None else position.trail_stop,
             target=None if position is None else position.target,
-            logged_to=logged,
+            logged_to=item["logged"],
             equity=self.state.equity,
         )
 
 
-def format_report(report: CycleReport) -> str:
+def _format_leg(report: CycleReport) -> list[str]:
     regime = report.regime
-    equity = "n/a" if report.equity is None else f"{report.equity:.2f}"
     conf = "" if report.gemini_confidence is None else f"{report.gemini_confidence:.2f} "
     rationale = (report.gemini_rationale or "")[:180]
-    lines = [
-        f"=== Gemini Trend Guard | {report.symbol} {report.timeframe} @ {report.exchange} ===",
+    return [
         f"bar        : {report.bar} ({'new close' if report.new_bar else 'already processed'})",
         f"close      : {report.close}",
         (
@@ -712,15 +876,32 @@ def format_report(report: CycleReport) -> str:
         ),
         f"signal     : {report.signal or 'none'}"
         + (f" ({report.signal_reason})" if report.signal_reason else ""),
-        f"breaker    : {'ON' if report.breaker_active else 'off'} (streak {report.loss_streak})",
         f"position   : {report.position}"
         + (f"  stop={report.stop} target={report.target}" if report.stop is not None else ""),
-        f"equity     : {equity}",
         f"gemini     : {report.gemini_action or '—'} {conf}{rationale}".rstrip(),
         f"result     : {report.verdict or '—'} ({report.reason})",
         f"logged     : {report.logged_to or '(nothing written)'}",
+    ]
+
+
+def format_report(report: CycleReport) -> str:
+    equity = "n/a" if report.equity is None else f"{report.equity:.2f}"
+    universe = " ".join(report.book) if report.book else report.symbol
+    lines = [
+        f"=== Gemini Trend Guard | {universe} {report.timeframe} @ {report.exchange} ===",
+        f"breaker    : {'ON' if report.breaker_active else 'off'} (streak {report.loss_streak})",
+        f"equity     : {equity}",
         f"model      : {report.model or '—'}",
     ]
+    if report.book:
+        book = " ".join(f"{symbol}={status}" for symbol, status in report.book.items())
+        lines.append(f"book       : {book}")
+    if len(report.legs) > 1:
+        for leg in report.legs:
+            lines.append(f"--- {leg.symbol} ---")
+            lines.extend(_format_leg(leg))
+    else:
+        lines.extend(_format_leg(report))
     return "\n".join(lines)
 
 
@@ -754,6 +935,7 @@ def main(argv: list[str] | None = None) -> int:
         symbol=args.symbol,
         timeframe=args.timeframe,
         exchange_id=args.exchange,
+        pairs=(args.symbol,) if args.symbol else None,
     )
 
     def run_once(consult_always: bool) -> CycleReport:
@@ -766,8 +948,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        f"Polling every {args.poll_interval}s | {runner.symbol} {runner.timeframe} "
-        f"@ {runner.exchange_id} | Ctrl+C to stop"
+        f"Polling every {args.poll_interval}s | {' '.join(runner.pairs)} {runner.timeframe} "
+        f"@ {runner.exchange_id} | cap={runner.max_open_positions} | Ctrl+C to stop"
     )
     while True:
         try:
