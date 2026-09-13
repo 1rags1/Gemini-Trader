@@ -17,9 +17,10 @@ from core.dashboard import PAGE, DASHBOARD_HOST, DASHBOARD_PORT, _enrich_trade, 
 def test_page_has_multi_pair_surfaces() -> None:
     assert 'id="pair-cards"' in PAGE
     assert ">Symbol</th>" in PAGE
+    assert ">1h Regime</th>" in PAGE
+    assert ">EMA 9</th>" in PAGE
     assert ">EMA 21</th>" in PAGE
-    assert ">EMA 55</th>" in PAGE
-    assert ">EMA 200</th>" in PAGE
+    assert ">15m ATR</th>" in PAGE
     assert DASHBOARD_HOST == "0.0.0.0"
     assert DASHBOARD_PORT == 8050
     print("    page + bind defaults")
@@ -48,8 +49,7 @@ def test_read_positions_book() -> None:
         json.dumps(
             {
                 "equity": 10100.0,
-                "loss_streak": 1,
-                "breaker_active": False,
+                "circuit_breaker": {"loss_streak": 1, "tripped": False},
                 "last_bar": "2026-09-11T16:00:00+00:00",
                 "last_bars": {
                     "BTC/USDT": "2026-09-11T16:00:00+00:00",

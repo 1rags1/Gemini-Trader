@@ -8,7 +8,17 @@ from __future__ import annotations
 
 import pandas as pd
 
-from core.config import get_settings
+from core.config import (
+    MACRO_ADX_PERIOD,
+    MACRO_ADX_THRESHOLD,
+    MACRO_EMA_FAST,
+    MACRO_EMA_SLOW,
+    MACRO_EMA_TREND,
+    TRIGGER_ATR_PERIOD,
+    TRIGGER_EMA_FAST,
+    TRIGGER_EMA_SLOW,
+    get_settings,
+)
 from core.net import enable_os_trust_store
 
 OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -94,6 +104,55 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     out.attrs.update(df.attrs)
     return out
+
+
+def add_macro_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """1h trend filter: EMA 21/55/200 and ADX 14."""
+    import pandas_ta as ta  # noqa: F401
+
+    out = df.copy()
+    out["ema_fast"] = ta.ema(out["close"], length=MACRO_EMA_FAST)
+    out["ema_slow"] = ta.ema(out["close"], length=MACRO_EMA_SLOW)
+    out["ema_macro"] = ta.ema(out["close"], length=MACRO_EMA_TREND)
+    adx = ta.adx(out["high"], out["low"], out["close"], length=MACRO_ADX_PERIOD)
+    if adx is not None:
+        out["adx"] = adx[f"ADX_{MACRO_ADX_PERIOD}"]
+        out["di_plus"] = adx[f"DMP_{MACRO_ADX_PERIOD}"]
+        out["di_minus"] = adx[f"DMN_{MACRO_ADX_PERIOD}"]
+    out.attrs.update(df.attrs)
+    return out
+
+
+def add_trigger_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """15m pullback trigger: EMA 9/21 and ATR 14."""
+    import pandas_ta as ta  # noqa: F401
+
+    out = df.copy()
+    out["ema_fast"] = ta.ema(out["close"], length=TRIGGER_EMA_FAST)
+    out["ema_slow"] = ta.ema(out["close"], length=TRIGGER_EMA_SLOW)
+    out["atr"] = ta.atr(out["high"], out["low"], out["close"], length=TRIGGER_ATR_PERIOD)
+    out.attrs.update(df.attrs)
+    return out
+
+
+def classify_macro_regime(bar: pd.Series, adx_threshold: float = MACRO_ADX_THRESHOLD) -> str:
+    """BULL only when 1h close > EMA 200, EMA 21 > EMA 55, and ADX is strong.
+
+    Otherwise NEUTRAL (weak ADX / incomplete indicators) or BEAR.
+    """
+    needed = ("close", "ema_fast", "ema_slow", "ema_macro", "adx")
+    if any(name not in bar.index or pd.isna(bar[name]) for name in needed):
+        return "NEUTRAL"
+    close = float(bar["close"])
+    ema21 = float(bar["ema_fast"])
+    ema55 = float(bar["ema_slow"])
+    ema200 = float(bar["ema_macro"])
+    adx = float(bar["adx"])
+    if close > ema200 and ema21 > ema55 and adx >= adx_threshold:
+        return "BULL"
+    if adx < adx_threshold:
+        return "NEUTRAL"
+    return "BEAR"
 
 
 def _regime(last: pd.Series, adx_min: float) -> dict:

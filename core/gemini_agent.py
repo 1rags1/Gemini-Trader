@@ -44,8 +44,8 @@ produced a 0.56 profit factor and a 34% commission load in backtesting.
 Risk rules:
 - Entries need trend agreement (fast EMA vs slow EMA) plus momentum
   confirmation (RSI beyond 50 in the trade's direction).
-- stop_loss is 1.5x ATR from price, take_profit is 3.75x ATR, giving 2.5:1.
-  Keep that ratio: a lower one cannot profit at this strategy's win rate.
+- stop_loss is 1.5x of the 15m ATR from price, take_profit is 3.5x ATR
+  (~1:2.33). Keep that ratio. The 1h regime block overrides the 15m trigger.
 - For HOLD, stop_loss and take_profit are null.
 
 Output rules:

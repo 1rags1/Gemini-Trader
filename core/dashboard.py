@@ -30,13 +30,21 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from core.config import (
+    MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
     PROJECT_ROOT,
     TRADING_PAIRS,
+    TRIGGER_TIMEFRAME,
     get_settings,
+    migrate_circuit_breaker,
     migrate_position_book,
 )
-from core.market_data import add_indicators, fetch_ohlcv, latest_snapshot
+from core.market_data import (
+    add_macro_indicators,
+    add_trigger_indicators,
+    classify_macro_regime,
+    fetch_ohlcv,
+)
 from core.net import enable_os_trust_store
 
 log = logging.getLogger("dashboard")
@@ -45,7 +53,8 @@ DASHBOARD_HOST = "0.0.0.0"
 DASHBOARD_PORT = 8050
 TRADE_LIMIT = 15
 MARKET_CACHE_TTL = 20.0
-MARKET_CANDLES = 300
+MACRO_CANDLES = 250
+TRIGGER_CANDLES = 100
 MARKET_FETCH_DELAY = 1.0
 
 _FILL_RE = re.compile(r"fill=([-\d.]+)")
@@ -153,6 +162,7 @@ def _position_cards(
                 "status": status if status not in {"", "FLAT"} else "FLAT",
                 "position": open_slot,
                 "last_bar": last_bars.get(symbol),
+                "macro_regime": str((slot or {}).get("macro_regime") or "UNKNOWN").upper(),
             }
         )
     return cards
@@ -207,6 +217,7 @@ def read_runner_state() -> dict[str, Any]:
     cards = _position_cards(book, last_bars, pairs)
     first_open = next((card["position"] for card in cards if card["position"] is not None), None)
     side = "FLAT" if first_open is None else str(first_open.get("side") or first_open.get("status") or "FLAT").upper()
+    breaker = migrate_circuit_breaker(raw if isinstance(raw, dict) else {})
 
     return {
         "exists": True,
@@ -214,8 +225,8 @@ def read_runner_state() -> dict[str, Any]:
         "starting_equity": starting,
         "pnl": pnl,
         "pnl_pct": None if pnl is None or starting == 0 else (pnl / starting) * 100.0,
-        "loss_streak": int(raw.get("loss_streak") or 0),
-        "breaker_active": bool(raw.get("breaker_active")),
+        "loss_streak": int(breaker["loss_streak"]),
+        "breaker_active": bool(breaker["tripped"]),
         "breaker_bars": int(raw.get("breaker_bars") or 0),
         "last_bar": raw.get("last_bar"),
         "last_bars": last_bars,
@@ -315,50 +326,85 @@ def read_reject_count() -> int:
         return 0
 
 
-def _pair_metrics(symbol: str, timeframe: str, exchange: str) -> dict[str, Any]:
+def _num(bar: Any, name: str) -> float | None:
+    try:
+        value = float(bar[name])
+    except Exception:
+        return None
+    if value != value:
+        return None
+    return value
+
+
+def _empty_pair_metrics(symbol: str, error: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": error is None,
+        "symbol": symbol,
+        "macro_regime": "CHOP",
+        "as_of": None,
+        "last_close": None,
+        "ema_fast": None,
+        "ema_slow": None,
+        "atr": None,
+        "adx": None,
+        "macro_close": None,
+        "macro_ema_fast": None,
+        "macro_ema_slow": None,
+        "macro_ema_trend": None,
+        "error": error,
+    }
+
+
+def _pair_metrics(symbol: str, exchange: str, *, paced: bool) -> dict[str, Any]:
     try:
         enable_os_trust_store()
-        frame = add_indicators(
-            fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=MARKET_CANDLES, exchange_id=exchange)
+        if paced and MARKET_FETCH_DELAY > 0:
+            time.sleep(MARKET_FETCH_DELAY)
+        macro = add_macro_indicators(
+            fetch_ohlcv(
+                symbol=symbol,
+                timeframe=MACRO_TIMEFRAME,
+                limit=MACRO_CANDLES,
+                exchange_id=exchange,
+            )
         )
-        snap = latest_snapshot(frame)
-        indicators = snap.get("indicators") or {}
+        if MARKET_FETCH_DELAY > 0:
+            time.sleep(MARKET_FETCH_DELAY)
+        trigger = add_trigger_indicators(
+            fetch_ohlcv(
+                symbol=symbol,
+                timeframe=TRIGGER_TIMEFRAME,
+                limit=TRIGGER_CANDLES,
+                exchange_id=exchange,
+            )
+        )
+        macro_last = macro.iloc[-2] if len(macro) >= 2 else macro.iloc[-1]
+        trigger_last = trigger.iloc[-2] if len(trigger) >= 2 else trigger.iloc[-1]
+        regime = classify_macro_regime(macro_last)
+        badge = "CHOP" if regime == "NEUTRAL" else regime
         return {
             "ok": True,
-            "symbol": snap.get("symbol") or symbol,
-            "timeframe": snap.get("timeframe") or timeframe,
-            "as_of": snap.get("as_of"),
-            "last_close": snap.get("last_close"),
-            "regime": snap.get("regime") or {},
-            "ema_fast": indicators.get("ema_fast"),
-            "ema_slow": indicators.get("ema_slow"),
-            "ema_macro": indicators.get("ema_macro"),
-            "rsi": indicators.get("rsi"),
-            "adx": indicators.get("adx"),
-            "atr": indicators.get("atr"),
+            "symbol": symbol,
+            "macro_regime": badge,
+            "as_of": trigger_last.name.isoformat() if hasattr(trigger_last.name, "isoformat") else str(trigger_last.name),
+            "last_close": _num(trigger_last, "close"),
+            "ema_fast": _num(trigger_last, "ema_fast"),
+            "ema_slow": _num(trigger_last, "ema_slow"),
+            "atr": _num(trigger_last, "atr"),
+            "adx": _num(macro_last, "adx"),
+            "macro_close": _num(macro_last, "close"),
+            "macro_ema_fast": _num(macro_last, "ema_fast"),
+            "macro_ema_slow": _num(macro_last, "ema_slow"),
+            "macro_ema_trend": _num(macro_last, "ema_macro"),
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001
         log.warning("market fetch failed for %s: %s", symbol, exc)
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "as_of": None,
-            "last_close": None,
-            "regime": {},
-            "ema_fast": None,
-            "ema_slow": None,
-            "ema_macro": None,
-            "rsi": None,
-            "adx": None,
-            "atr": None,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return _empty_pair_metrics(symbol, error=f"{type(exc).__name__}: {exc}")
 
 
 def fetch_market() -> dict[str, Any]:
-    """Latest snapshot per pair, cached so a 10s poll does not hammer Kraken."""
+    """Latest 1h + 15m snapshot per pair, cached so polls do not hammer Kraken."""
     now = time.monotonic()
     with _market_lock:
         age = now - float(_market_cache["fetched_at"])
@@ -367,19 +413,16 @@ def fetch_market() -> dict[str, Any]:
 
     cfg = _cfg()
     pairs = _pairs()
-    timeframe = cfg.timeframe if cfg is not None else "1h"
     exchange = cfg.exchange_id if cfg is not None else "kraken"
 
     rows: list[dict[str, Any]] = []
     for index, symbol in enumerate(pairs):
-        if index > 0 and MARKET_FETCH_DELAY > 0:
-            time.sleep(MARKET_FETCH_DELAY)
-        rows.append(_pair_metrics(symbol, timeframe, exchange))
+        rows.append(_pair_metrics(symbol, exchange, paced=index > 0))
 
     errors = [row["error"] for row in rows if row.get("error")]
     payload = {
         "ok": any(row.get("ok") for row in rows),
-        "timeframe": timeframe,
+        "timeframe": f"{MACRO_TIMEFRAME}/{TRIGGER_TIMEFRAME}",
         "exchange": exchange,
         "as_of": next((row.get("as_of") for row in rows if row.get("as_of")), None),
         "pairs": rows,
@@ -454,7 +497,7 @@ PAGE = r"""<!DOCTYPE html>
         <p id="pnl" class="text-sm mt-2">—</p>
       </article>
       <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p class="text-xs uppercase tracking-wider text-slate-400">Open slots</p>
+        <p class="text-xs uppercase tracking-wider text-slate-400">Active slots</p>
         <p id="slots" class="text-3xl font-semibold mt-1 mono">—</p>
         <p id="slots-detail" class="text-xs text-slate-400 mt-2">Waiting for book</p>
       </article>
@@ -476,12 +519,12 @@ PAGE = r"""<!DOCTYPE html>
           <thead class="text-left text-xs uppercase tracking-wider text-slate-500">
             <tr>
               <th class="pr-4 py-2 font-medium">Pair</th>
-              <th class="px-3 py-2 font-medium text-right">Close</th>
-              <th class="px-3 py-2 font-medium text-right">EMA 21</th>
-              <th class="px-3 py-2 font-medium text-right">EMA 55</th>
-              <th class="px-3 py-2 font-medium text-right">EMA 200</th>
-              <th class="px-3 py-2 font-medium text-right">RSI</th>
+              <th class="px-3 py-2 font-medium">1h Regime</th>
               <th class="px-3 py-2 font-medium text-right">ADX</th>
+              <th class="px-3 py-2 font-medium text-right">15m Close</th>
+              <th class="px-3 py-2 font-medium text-right">EMA 9</th>
+              <th class="px-3 py-2 font-medium text-right">EMA 21</th>
+              <th class="px-3 py-2 font-medium text-right">15m ATR</th>
             </tr>
           </thead>
           <tbody id="metrics" class="divide-y divide-white/5"></tbody>
@@ -535,14 +578,21 @@ PAGE = r"""<!DOCTYPE html>
       const s = data.state || {};
       const m = data.market || {};
       const cards = s.positions || [];
+      const marketBySymbol = Object.fromEntries((m.pairs || []).map(row => [row.symbol, row]));
+      const toneRegime = (reg) => ({BULL:"green", BEAR:"red", CHOP:"amber", NEUTRAL:"amber"}[reg] || "slate");
       document.getElementById("pair-cards").innerHTML = cards.map(card => {
         const side = card.status || "FLAT";
         const p = card.position;
+        const live = marketBySymbol[card.symbol] || {};
+        const regime = live.macro_regime || card.macro_regime || "CHOP";
         const detail = p
-          ? `Entry ${px(p.entry_price)} · stop ${px(p.trail_stop || p.stop)} · target ${px(p.target)}${p.trail_armed ? " · trail armed" : ""}`
-          : (card.last_bar ? `Last closed bar ${card.last_bar}` : "No open position");
+          ? `Entry ${px(p.entry_price)} · stop ${px(p.stop_loss || p.trail_stop || p.stop)} · target ${px(p.take_profit || p.target)}`
+          : (card.last_bar ? `Last 15m bar ${card.last_bar}` : "No open position");
         return `<article class="bg-panel rounded-xl border border-white/5 p-4">
-          <p class="text-xs uppercase tracking-wider text-slate-400">${card.symbol || "—"}</p>
+          <div class="flex items-center justify-between gap-2">
+            <p class="text-xs uppercase tracking-wider text-slate-400">${card.symbol || "—"}</p>
+            ${badge(toneRegime(regime), `${regime}${live.adx != null ? " ADX " + fmt(live.adx, 1) : ""}`)}
+          </div>
           <p class="text-3xl font-semibold mt-1 ${tonePos(side)}">${side}</p>
           <p class="text-xs text-slate-400 mt-2 leading-relaxed">${detail}</p>
         </article>`;
@@ -561,9 +611,11 @@ PAGE = r"""<!DOCTYPE html>
       const openCount = s.open_count || 0;
       const maxOpen = s.max_open_positions || 0;
       document.getElementById("slots").textContent = maxOpen ? `${openCount} / ${maxOpen}` : String(openCount);
-      document.getElementById("slots-detail").textContent = openCount
-        ? cards.filter(c => c.status && c.status !== "FLAT").map(c => `${c.symbol} ${c.status}`).join(" · ")
-        : "All pairs flat";
+      document.getElementById("slots-detail").textContent = `Active Slots: ${openCount} / ${maxOpen || 2}` + (
+        openCount
+          ? " · " + cards.filter(c => c.status && c.status !== "FLAT").map(c => `${c.symbol} ${c.status}`).join(" · ")
+          : " · all pairs flat"
+      );
 
       document.getElementById("breaker").textContent = s.breaker_active ? "ON" : "off";
       document.getElementById("breaker").className = "text-3xl font-semibold mt-1 " + (s.breaker_active ? "text-rose-300" : "text-teal-300");
@@ -580,14 +632,16 @@ PAGE = r"""<!DOCTYPE html>
       } else {
         metrics.innerHTML = pairRows.map(row => {
           const errNote = row.error ? `<div class="text-[11px] text-rose-300 mt-1">${row.error}</div>` : "";
+          const regime = row.macro_regime || "CHOP";
+          const regimeTone = {BULL:"green", BEAR:"red", CHOP:"amber", NEUTRAL:"amber"}[regime] || "slate";
           return `<tr class="hover:bg-white/[0.02]">
             <td class="pr-4 py-2.5 font-medium text-slate-200 whitespace-nowrap">${row.symbol || "—"}${errNote}</td>
+            <td class="px-3 py-2.5">${badge(regimeTone, regime)}</td>
+            <td class="px-3 py-2.5 mono text-right">${fmt(row.adx, 1)}</td>
             <td class="px-3 py-2.5 mono text-right">${px(row.last_close)}</td>
             <td class="px-3 py-2.5 mono text-right">${px(row.ema_fast)}</td>
             <td class="px-3 py-2.5 mono text-right">${px(row.ema_slow)}</td>
-            <td class="px-3 py-2.5 mono text-right">${px(row.ema_macro)}</td>
-            <td class="px-3 py-2.5 mono text-right">${fmt(row.rsi, 1)}</td>
-            <td class="px-3 py-2.5 mono text-right">${fmt(row.adx, 1)}</td>
+            <td class="px-3 py-2.5 mono text-right">${px(row.atr)}</td>
           </tr>`;
         }).join("");
       }

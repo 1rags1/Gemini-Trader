@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.gemini_agent import Decision
 from core.config import TRADING_PAIRS
+from core.market_data import classify_macro_regime
 from core.strategy_runner import (
     Position,
     RunnerState,
@@ -29,9 +30,11 @@ from core.strategy_runner import (
     apply_breaker,
     count_open_positions,
     detect_signal,
+    detect_trigger,
     fraction_qty,
     last_closed_ts,
     maybe_exit,
+    mtf_maybe_exit,
     position_qty,
     update_trail,
 )
@@ -42,6 +45,7 @@ PARAMS = json.loads(
 
 START = pd.Timestamp("2026-01-01 00:00:00", tz="UTC")
 NOW = pd.Timestamp("2026-01-01 05:30:00", tz="UTC")
+TRIGGER_START = pd.Timestamp("2026-01-01 04:00:00", tz="UTC")
 
 
 class StubAgent:
@@ -103,11 +107,44 @@ def _row(
     }
 
 
-def make_frame(rows: list[dict]) -> pd.DataFrame:
-    idx = pd.date_range(START, periods=len(rows), freq="h", tz="UTC")
+def make_frame(rows: list[dict], *, freq: str = "h", start: pd.Timestamp | None = None, timeframe: str = "1h") -> pd.DataFrame:
+    idx = pd.date_range(start or START, periods=len(rows), freq=freq, tz="UTC")
     df = pd.DataFrame(rows, index=idx)
-    df.attrs.update(symbol="BTC/USDT", timeframe="1h", exchange="kraken")
+    df.attrs.update(symbol="BTC/USDT", timeframe=timeframe, exchange="kraken")
     return df
+
+
+def make_trigger_frame(rows: list[dict]) -> pd.DataFrame:
+    return make_frame(rows, freq="15min", start=TRIGGER_START, timeframe="15m")
+
+
+def macro_bull_frame() -> pd.DataFrame:
+    bull = _row(10000, 100.5, 99.0, adx=25.0, ema_macro=9000)
+    return make_frame([bull] * 6)
+
+
+def macro_bear_frame() -> pd.DataFrame:
+    bear = _row(10000, 99.0, 100.5, adx=25.0, ema_macro=11000)
+    return make_frame([bear] * 6)
+
+
+def trigger_cross_frame() -> pd.DataFrame:
+    """Last closed 15m (05:15) is an EMA 9/21 cross-up."""
+    return make_trigger_frame(
+        [
+            _row(10000, 99, 100, atr=100),
+            _row(10000, 99, 100, atr=100),
+            _row(10000, 99.5, 100, atr=100),
+            _row(10000, 99.9, 100, atr=100),
+            _row(10000, 99.95, 100, atr=100),
+            _row(10000, 100.1, 100, atr=100),
+            _row(10020, 100.3, 100, atr=100),
+        ]
+    )
+
+
+def trigger_flat_frame() -> pd.DataFrame:
+    return make_trigger_frame([_row(10000, 110, 100, atr=100)] * 7)
 
 
 def long_crossover_frame() -> pd.DataFrame:
@@ -137,15 +174,24 @@ def short_crossover_frame() -> pd.DataFrame:
     )
 
 
-def runner_for(frame: pd.DataFrame, agent: StubAgent, tmp: Path, **kwargs) -> StrategyRunner:
+def runner_for(
+    macro: pd.DataFrame,
+    trigger: pd.DataFrame,
+    agent: StubAgent,
+    tmp: Path,
+    **kwargs,
+) -> StrategyRunner:
+    def fetch(*, timeframe: str, **_k):
+        return (macro if timeframe == "1h" else trigger).copy()
+
     return StrategyRunner(
         agent=agent,
-        fetch_fn=kwargs.pop("fetch_fn", lambda **_k: frame.copy()),
+        fetch_fn=kwargs.pop("fetch_fn", fetch),
         indicate_fn=lambda df: df,
         params=PARAMS,
         strategy_context="test",
         symbol=kwargs.pop("symbol", "BTC/USDT"),
-        timeframe="1h",
+        timeframe="15m",
         exchange_id="kraken",
         min_confidence=0.6,
         starting_equity=10_000.0,
@@ -194,6 +240,49 @@ def test_long_signal_requires_crossover_rsi_and_regime() -> None:
     tired.iloc[-1, tired.columns.get_loc("rsi")] = 40
     assert detect_signal(tired, PARAMS, False) is None
     print("    long signal + four gates")
+
+
+def test_macro_regime_and_trigger() -> None:
+    bull = classify_macro_regime(macro_bull_frame().iloc[-2])
+    bear = classify_macro_regime(macro_bear_frame().iloc[-2])
+    chop_row = _row(10000, 100.5, 99.0, adx=12.0, ema_macro=9000)
+    assert bull == "BULL"
+    assert bear == "BEAR"
+    assert classify_macro_regime(pd.Series(chop_row)) == "NEUTRAL"
+
+    trigger = trigger_cross_frame()
+    closed = trigger.loc[: trigger.index[5]]
+    signal = detect_trigger(closed)
+    assert signal is not None and signal.action == "BUY"
+    assert abs(signal.stop - 9850) < 1e-9
+    assert abs(signal.target - 10350) < 1e-9
+    assert detect_trigger(trigger_flat_frame().loc[: trigger_flat_frame().index[5]]) is None
+    print("    BULL/BEAR/CHOP + 15m cross")
+
+
+def test_mtf_stop_and_regime_exit() -> None:
+    pos = Position(
+        side="LONG",
+        entry_price=10000,
+        entry_atr=100,
+        qty=1,
+        stop=9850,
+        target=10350,
+        trail_stop=9850,
+        trail_armed=False,
+        opened_bar="x",
+        confidence=0.9,
+        model="stub",
+        rationale="",
+        reason="t",
+    )
+    stop = mtf_maybe_exit(pos, high=10400, low=9800, close=10000, regime="BULL")
+    assert stop is not None and stop.hit == "stop"
+    win = mtf_maybe_exit(pos, high=10400, low=9900, close=10100, regime="BULL")
+    assert win is not None and win.hit == "target"
+    flip = mtf_maybe_exit(pos, high=10100, low=9950, close=10000, regime="BEAR")
+    assert flip is not None and flip.hit == "regime"
+    print("    MTF stop / target / regime exit")
 
 
 def test_short_signal() -> None:
@@ -282,26 +371,27 @@ def test_risk_sizing_is_capped() -> None:
 
 def test_confirmed_entry_is_logged(tmp: Path | None = None) -> None:
     tmp = tmp or tmpdir()
-    agent = StubAgent("BUY", 0.88, stop=9850, target=10375)
-    runner = runner_for(long_crossover_frame(), agent, tmp)
+    agent = StubAgent("BUY", 0.88)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
     report = runner.cycle(now=NOW)
     assert report.signal == "BUY"
     assert report.verdict == "CONFIRMED"
     assert report.position == "LONG"
+    assert report.macro_regime == "BULL"
     assert agent.calls == 1
     rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
     assert len(rows) == 1
     assert rows[0]["action"] == "BUY"
     assert rows[0]["verdict"] == "CONFIRMED"
     assert float(rows[0]["stop_loss"]) == 9850
-    assert float(rows[0]["take_profit"]) == 10375
+    assert float(rows[0]["take_profit"]) == 10350
     print(f"    logged BUY @ {rows[0]['entry_price']}")
 
 
 def test_repeat_cycle_does_not_double_enter() -> None:
     tmp = tmpdir()
-    agent = StubAgent("BUY", 0.9, stop=9850, target=10375)
-    runner = runner_for(long_crossover_frame(), agent, tmp)
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
     first = runner.cycle(now=NOW)
     second = runner.cycle(now=NOW)
     assert first.verdict == "CONFIRMED"
@@ -315,7 +405,7 @@ def test_repeat_cycle_does_not_double_enter() -> None:
 def test_reject_and_fail_closed() -> None:
     tmp = tmpdir()
     hold = StubAgent("HOLD", 0.95)
-    runner = runner_for(long_crossover_frame(), hold, tmp)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), hold, tmp)
     report = runner.cycle(now=NOW)
     assert report.verdict == "REJECTED"
     assert report.reason == "agent_returned_HOLD"
@@ -325,7 +415,7 @@ def test_reject_and_fail_closed() -> None:
 
     tmp2 = tmpdir()
     dead = StubAgent(error=RuntimeError("quota"))
-    runner = runner_for(long_crossover_frame(), dead, tmp2)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), dead, tmp2)
     report = runner.cycle(now=NOW)
     assert report.verdict == "REJECTED"
     assert report.reason == "agent_unavailable"
@@ -334,8 +424,8 @@ def test_reject_and_fail_closed() -> None:
 
 def test_low_confidence_rejected() -> None:
     tmp = tmpdir()
-    timid = StubAgent("BUY", 0.2, stop=9850, target=10375)
-    report = runner_for(long_crossover_frame(), timid, tmp).cycle(now=NOW)
+    timid = StubAgent("BUY", 0.2)
+    report = runner_for(macro_bull_frame(), trigger_cross_frame(), timid, tmp).cycle(now=NOW)
     assert report.verdict == "REJECTED"
     assert "confidence_0.20_below_0.60" in report.reason
     print("    low confidence rejected")
@@ -343,42 +433,51 @@ def test_low_confidence_rejected() -> None:
 
 def test_open_position_closes_on_stop() -> None:
     tmp = tmpdir()
-    agent = StubAgent("BUY", 0.9, stop=9850, target=10375)
-    runner = runner_for(long_crossover_frame(), agent, tmp)
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
     runner.cycle(now=NOW)
     assert runner.state.position is not None
 
-    # Next hour: forming bar prints the stop. Advance time so 05:00 is closed and 06:00 forms.
-    punched = long_crossover_frame()
-    punched.loc[punched.index[5], ["low", "close", "high"]] = (9800, 9900, 10000)
+    punched = trigger_cross_frame()
+    punched.loc[punched.index[6], ["low", "close", "high"]] = (9800, 9900, 10000)
     extra = punched.copy()
-    extra.loc[pd.Timestamp("2026-01-01 06:00:00", tz="UTC")] = _row(9900, 100.4, 100)
-    later = pd.Timestamp("2026-01-01 06:30:00", tz="UTC")
-    runner.fetch_fn = lambda **_k: extra
+    extra.loc[pd.Timestamp("2026-01-01 05:45:00", tz="UTC")] = _row(9900, 100.4, 100, atr=100)
+    later = pd.Timestamp("2026-01-01 05:52:00", tz="UTC")
+    runner.fetch_fn = lambda *, timeframe, **_k: (
+        macro_bull_frame() if timeframe == "1h" else extra
+    )
     report = runner.cycle(now=later)
     assert report.verdict == "CONFIRMED"
-    assert report.reason == "initial_stop_or_target_long"
+    assert report.reason == "atr_stop_long"
     assert report.position == "FLAT"
     rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
     assert rows[-1]["action"] == "CLOSE"
     print(f"    closed via stop, equity={runner.state.equity:.2f}")
 
 
+def test_regime_flip_exits_long() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
+    runner.cycle(now=NOW)
+    later = pd.Timestamp("2026-01-01 05:52:00", tz="UTC")
+    trigger = trigger_cross_frame()
+    trigger.loc[pd.Timestamp("2026-01-01 05:45:00", tz="UTC")] = _row(10010, 100.4, 100, atr=100)
+    runner.fetch_fn = lambda *, timeframe, **_k: (
+        macro_bear_frame() if timeframe == "1h" else trigger
+    )
+    report = runner.cycle(now=later)
+    assert report.reason == "macro_regime_exit"
+    assert report.position == "FLAT"
+    print("    BEAR flip closed the long")
+
+
 def test_once_consults_gemini_without_signal() -> None:
     tmp = tmpdir()
-    # No crossover: fast stays above slow.
-    frame = make_frame(
-        [
-            _row(10000, 110, 100),
-            _row(10000, 110, 100),
-            _row(10000, 110, 100),
-            _row(10000, 110, 100),
-            _row(10000, 110, 100),
-            _row(10020, 110, 100),
-        ]
-    )
     agent = StubAgent("HOLD", 0.4)
-    report = runner_for(frame, agent, tmp).cycle(consult_always=True, now=NOW)
+    report = runner_for(macro_bull_frame(), trigger_flat_frame(), agent, tmp).cycle(
+        consult_always=True, now=NOW
+    )
     assert report.signal is None
     assert agent.calls == 1
     assert report.gemini_action == "HOLD"
@@ -389,16 +488,18 @@ def test_once_consults_gemini_without_signal() -> None:
 
 def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     tmp = tmpdir()
-    fetched: list[str] = []
-    frame = long_crossover_frame()
+    fetched: list[tuple[str, str]] = []
+    macro = macro_bull_frame()
+    trigger = trigger_cross_frame()
 
-    def fetch(*, symbol: str, **_k):
-        fetched.append(symbol)
-        return frame.copy()
+    def fetch(*, symbol: str, timeframe: str, **_k):
+        fetched.append((symbol, timeframe))
+        return (macro if timeframe == "1h" else trigger).copy()
 
-    agent = StubAgent("BUY", 0.9, stop=9850, target=10375)
+    agent = StubAgent("BUY", 0.9)
     runner = runner_for(
-        frame,
+        macro,
+        trigger,
         agent,
         tmp,
         fetch_fn=fetch,
@@ -406,7 +507,9 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
         fetch_delay=0,
     )
     report = runner.cycle(now=NOW)
-    assert fetched == list(TRADING_PAIRS)
+    assert fetched == [
+        (symbol, tf) for symbol in TRADING_PAIRS for tf in ("1h", "15m")
+    ]
     assert len(report.legs) == 3
     assert report.book["BTC/USDT"] == "LONG"
     assert report.book["ETH/USDT"] == "LONG"
@@ -416,19 +519,21 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     assert sol.reason == "max_open_positions"
     assert sol.signal == "BUY"
     btc_qty = runner.state.positions["BTC/USDT"]["qty"]
-    assert abs(btc_qty - 0.33) < 1e-9
+    assert abs(btc_qty - 0.48) < 1e-9
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
+    assert saved["circuit_breaker"]["tripped"] is False
     assert saved["positions"]["BTC/USDT"]["status"] == "LONG"
+    assert saved["positions"]["BTC/USDT"]["size"] == btc_qty
     assert saved["positions"]["ETH/USDT"]["status"] == "LONG"
     assert saved["positions"]["SOL/USDT"]["status"] == "FLAT"
     assert agent.calls == 2
-    print("    scanned 3 pairs, opened 2, sized 33%")
+    print("    scanned 3 pairs x 2 timeframes, opened 2, sized 48%")
 
 
 def test_breaker_blocks_entry() -> None:
     tmp = tmpdir()
-    agent = StubAgent("BUY", 0.9, stop=9850, target=10375)
-    runner = runner_for(long_crossover_frame(), agent, tmp)
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
     runner.state.loss_streak = 4
     runner.state.equity_history = [10000, 9000, 8500, 8000]
     report = runner.cycle(now=NOW)
@@ -439,10 +544,22 @@ def test_breaker_blocks_entry() -> None:
     print("    breaker suppressed the long")
 
 
+def test_bear_macro_blocks_trigger() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    report = runner_for(macro_bear_frame(), trigger_cross_frame(), agent, tmp).cycle(now=NOW)
+    assert report.position == "FLAT"
+    assert report.reason == "macro_bear"
+    assert agent.calls == 0
+    print("    BEAR 1h blocked the 15m cross")
+
+
 def main() -> int:
     checks = [
         ("last closed skips forming bar", test_last_closed_skips_forming_bar),
         ("long signal + regime gates", test_long_signal_requires_crossover_rsi_and_regime),
+        ("MTF regime + trigger", test_macro_regime_and_trigger),
+        ("MTF exits", test_mtf_stop_and_regime_exit),
         ("short signal", test_short_signal),
         ("trail arm 2.75 / 1.75", test_trail_arms_at_2_75_and_locks_0_67r),
         ("stop beats target same bar", test_stop_beats_target_on_same_bar),
@@ -453,9 +570,11 @@ def main() -> int:
         ("reject and fail closed", test_reject_and_fail_closed),
         ("low confidence rejected", test_low_confidence_rejected),
         ("stop closes position", test_open_position_closes_on_stop),
+        ("regime flip exits long", test_regime_flip_exits_long),
         ("--once consults without signal", test_once_consults_gemini_without_signal),
         ("multi-pair scan + cap", test_multi_pair_scan_caps_opens_and_sizes),
         ("breaker blocks entry", test_breaker_blocks_entry),
+        ("bear macro blocks trigger", test_bear_macro_blocks_trigger),
     ]
     failures = 0
     for label, check in checks:

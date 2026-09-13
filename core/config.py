@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -41,12 +42,38 @@ DEFAULT_TIMEOUT_MS = 20_000
 #: as a comma-separated list.
 TRADING_PAIRS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
 
-#: Hard cap on concurrent paper positions so three simultaneous signals cannot
-#: put the whole book on at once.
+#: 1h candles gate the tradeable direction. 15m candles fire the pullback.
+MACRO_TIMEFRAME = "1h"
+TRIGGER_TIMEFRAME = "15m"
+
+#: Poll often enough to see a new 15m close within one bar.
+POLL_INTERVAL_SECONDS = 30
+
+#: Macro (1h) trend filter.
+MACRO_EMA_FAST = 21
+MACRO_EMA_SLOW = 55
+MACRO_EMA_TREND = 200
+MACRO_ADX_PERIOD = 14
+MACRO_ADX_THRESHOLD = 20.0
+
+#: Trigger (15m) pullback / ATR risk.
+TRIGGER_EMA_FAST = 9
+TRIGGER_EMA_SLOW = 21
+TRIGGER_ATR_PERIOD = 14
+
+#: Hard cap on concurrent paper positions across the whole book.
 MAX_OPEN_POSITIONS = 2
 
-#: Fraction of current equity allocated to each new fill (~33% per slot).
-POSITION_SIZE_FRACTION = 0.33
+#: Fraction of current equity allocated to each new fill. 0.48 leaves room
+#: for fees on a $100–$200 account while still using two slots.
+POSITION_SIZE_FRACTION = 0.48
+
+#: 15m ATR multiples. 1.5 / 3.5 is about 1 : 2.33 risk-to-reward.
+ATR_STOP_MULTIPLIER = 1.5
+ATR_PROFIT_MULTIPLIER = 3.5
+
+#: Spot accounts cannot sell short. The runner skips SELL entries when True.
+SPOT_LONG_ONLY = True
 
 
 @dataclass(frozen=True)
@@ -58,9 +85,23 @@ class Settings:
     exchange_id: str = DEFAULT_EXCHANGE
     symbol: str = "BTC/USDT"
     trading_pairs: tuple[str, ...] = TRADING_PAIRS
+    macro_timeframe: str = MACRO_TIMEFRAME
+    trigger_timeframe: str = TRIGGER_TIMEFRAME
+    poll_interval_seconds: int = POLL_INTERVAL_SECONDS
+    macro_ema_fast: int = MACRO_EMA_FAST
+    macro_ema_slow: int = MACRO_EMA_SLOW
+    macro_ema_trend: int = MACRO_EMA_TREND
+    macro_adx_period: int = MACRO_ADX_PERIOD
+    macro_adx_threshold: float = MACRO_ADX_THRESHOLD
+    trigger_ema_fast: int = TRIGGER_EMA_FAST
+    trigger_ema_slow: int = TRIGGER_EMA_SLOW
+    trigger_atr_period: int = TRIGGER_ATR_PERIOD
     max_open_positions: int = MAX_OPEN_POSITIONS
     position_size_fraction: float = POSITION_SIZE_FRACTION
-    timeframe: str = "1h"
+    atr_stop_multiplier: float = ATR_STOP_MULTIPLIER
+    atr_profit_multiplier: float = ATR_PROFIT_MULTIPLIER
+    spot_long_only: bool = SPOT_LONG_ONLY
+    timeframe: str = TRIGGER_TIMEFRAME
     candle_limit: int = 500
     paper_starting_balance: float = 10_000.0
 
@@ -85,36 +126,151 @@ class Settings:
         return f"{self.gemini_api_key[:4]}...{self.gemini_api_key[-4:]}"
 
 
+def empty_circuit_breaker() -> dict[str, Any]:
+    return {"loss_streak": 0, "tripped": False}
+
+
+def empty_position_slot(macro_regime: str = "UNKNOWN") -> dict[str, Any]:
+    """Canonical FLAT slot for the multi-timeframe book."""
+    return {
+        "status": "FLAT",
+        "entry_price": 0.0,
+        "size": 0.0,
+        "stop_loss": 0.0,
+        "take_profit": 0.0,
+        "entry_time": None,
+        "macro_regime": str(macro_regime or "UNKNOWN").upper(),
+    }
+
+
 def empty_position_book(pairs: tuple[str, ...] | None = None) -> dict[str, dict]:
     """FLAT slot for every configured pair."""
-    return {symbol: {"status": "FLAT"} for symbol in (pairs or TRADING_PAIRS)}
+    return {symbol: empty_position_slot() for symbol in (pairs or TRADING_PAIRS)}
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def canonical_position_slot(slot: dict[str, Any] | None) -> dict[str, Any]:
+    """Project any slot onto the MTF book fields (drops runner-only extras)."""
+    base = empty_position_slot()
+    if not isinstance(slot, dict):
+        return base
+    status = str(slot.get("status") or slot.get("side") or "FLAT").upper() or "FLAT"
+    size = slot.get("size", slot.get("qty", 0.0))
+    stop = slot.get("stop_loss", slot.get("trail_stop", slot.get("stop", 0.0)))
+    target = slot.get("take_profit", slot.get("target", 0.0))
+    entry_time = slot.get("entry_time", slot.get("opened_bar"))
+    if status in {"", "FLAT"}:
+        return empty_position_slot(str(slot.get("macro_regime") or "UNKNOWN"))
+    return {
+        "status": status,
+        "entry_price": _as_float(slot.get("entry_price")),
+        "size": _as_float(size),
+        "stop_loss": _as_float(stop),
+        "take_profit": _as_float(target),
+        "entry_time": entry_time or None,
+        "macro_regime": str(slot.get("macro_regime") or ("BULL" if status == "LONG" else "BEAR")).upper(),
+    }
+
+
+def hydrate_position_slot(slot: dict[str, Any] | None) -> dict[str, Any]:
+    """Canonical MTF fields plus aliases the current runner still reads."""
+    canonical = canonical_position_slot(slot)
+    if not isinstance(slot, dict):
+        extras: dict[str, Any] = {}
+    else:
+        extras = {
+            key: value
+            for key, value in slot.items()
+            if key not in canonical
+        }
+    hydrated = {**extras, **canonical}
+    hydrated.setdefault("side", canonical["status"])
+    hydrated.setdefault("qty", canonical["size"])
+    hydrated.setdefault("stop", canonical["stop_loss"])
+    hydrated.setdefault("target", canonical["take_profit"])
+    hydrated.setdefault("trail_stop", canonical["stop_loss"])
+    hydrated.setdefault("opened_bar", canonical["entry_time"])
+    return hydrated
+
+
+def migrate_circuit_breaker(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Accept nested `circuit_breaker` or the older top-level breaker keys."""
+    raw = raw or {}
+    nested = raw.get("circuit_breaker")
+    if isinstance(nested, dict):
+        streak = nested.get("loss_streak", raw.get("loss_streak", 0))
+        if "tripped" in nested:
+            tripped = nested.get("tripped")
+        else:
+            tripped = nested.get("active", raw.get("breaker_active", False))
+        return {"loss_streak": int(streak or 0), "tripped": bool(tripped)}
+    return {
+        "loss_streak": int(raw.get("loss_streak") or 0),
+        "tripped": bool(raw.get("breaker_active") or raw.get("tripped") or False),
+    }
 
 
 def migrate_position_book(raw: dict, pairs: tuple[str, ...] | None = None) -> dict[str, dict]:
-    """Build a per-symbol book from either the new or the legacy state file.
-
-    Legacy files stored a single `position` object (or null). Equity and the
-    other scalar fields are left untouched; this only reshapes the book.
-    """
+    """Build a per-symbol MTF book from either the new or the legacy state file."""
     pairs = pairs or TRADING_PAIRS
     book = empty_position_book(pairs)
     incoming = raw.get("positions")
     if isinstance(incoming, dict):
         for symbol, slot in incoming.items():
             if isinstance(slot, dict):
-                book[symbol] = dict(slot)
-                book[symbol].setdefault(
-                    "status",
-                    str(slot.get("side") or slot.get("status") or "FLAT").upper(),
-                )
+                book[symbol] = hydrate_position_slot(slot)
 
     legacy = raw.get("position")
     if isinstance(legacy, dict):
         status = str(legacy.get("status") or legacy.get("side") or "FLAT").upper()
         if status not in {"", "FLAT"}:
             symbol = legacy.get("symbol") or (pairs[0] if pairs else "BTC/USDT")
-            book[symbol] = {**legacy, "status": status, "symbol": symbol}
+            book[symbol] = hydrate_position_slot({**legacy, "status": status, "symbol": symbol})
     return book
+
+
+def dump_runner_state(
+    *,
+    equity: float,
+    positions: dict[str, dict],
+    circuit_breaker: dict[str, Any] | None = None,
+    equity_history: list[float] | None = None,
+    last_bar: str | None = None,
+    last_bars: dict[str, str] | None = None,
+    breaker_bars: int = 0,
+    pairs: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Serialize runner state in the MTF schema.
+
+    `last_bars` / `equity_history` stay on disk so the current cycle can still
+    skip a bar it already processed. They are not part of the public book.
+    """
+    pairs = pairs or TRADING_PAIRS
+    book = empty_position_book(pairs)
+    for symbol, slot in (positions or {}).items():
+        book[symbol] = canonical_position_slot(slot)
+    payload: dict[str, Any] = {
+        "equity": float(equity),
+        "circuit_breaker": migrate_circuit_breaker(circuit_breaker),
+        "positions": book,
+    }
+    if equity_history is not None:
+        payload["equity_history"] = list(equity_history)
+    if last_bar is not None:
+        payload["last_bar"] = last_bar
+    if last_bars is not None:
+        payload["last_bars"] = dict(last_bars)
+    if breaker_bars:
+        payload["breaker_bars"] = int(breaker_bars)
+    return payload
 
 
 def legacy_open_slot(positions: dict[str, dict]) -> dict | None:
@@ -133,6 +289,13 @@ def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     load_dotenv(ENV_PATH, override=False)
@@ -144,6 +307,7 @@ def get_settings() -> Settings:
             "    GEMINI_API_KEY=your_key_here"
         )
 
+    trigger = os.getenv("TRIGGER_TIMEFRAME", TRIGGER_TIMEFRAME)
     return Settings(
         gemini_api_key=api_key,
         gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_MODEL),
@@ -152,11 +316,27 @@ def get_settings() -> Settings:
         exchange_id=os.getenv("EXCHANGE_ID", DEFAULT_EXCHANGE),
         symbol=os.getenv("SYMBOL", "BTC/USDT"),
         trading_pairs=_csv_env("TRADING_PAIRS", TRADING_PAIRS),
+        macro_timeframe=os.getenv("MACRO_TIMEFRAME", MACRO_TIMEFRAME),
+        trigger_timeframe=trigger,
+        poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", str(POLL_INTERVAL_SECONDS))),
+        macro_ema_fast=int(os.getenv("MACRO_EMA_FAST", str(MACRO_EMA_FAST))),
+        macro_ema_slow=int(os.getenv("MACRO_EMA_SLOW", str(MACRO_EMA_SLOW))),
+        macro_ema_trend=int(os.getenv("MACRO_EMA_TREND", str(MACRO_EMA_TREND))),
+        macro_adx_period=int(os.getenv("MACRO_ADX_PERIOD", str(MACRO_ADX_PERIOD))),
+        macro_adx_threshold=float(os.getenv("MACRO_ADX_THRESHOLD", str(MACRO_ADX_THRESHOLD))),
+        trigger_ema_fast=int(os.getenv("TRIGGER_EMA_FAST", str(TRIGGER_EMA_FAST))),
+        trigger_ema_slow=int(os.getenv("TRIGGER_EMA_SLOW", str(TRIGGER_EMA_SLOW))),
+        trigger_atr_period=int(os.getenv("TRIGGER_ATR_PERIOD", str(TRIGGER_ATR_PERIOD))),
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", str(MAX_OPEN_POSITIONS))),
         position_size_fraction=float(
             os.getenv("POSITION_SIZE_FRACTION", str(POSITION_SIZE_FRACTION))
         ),
-        timeframe=os.getenv("TIMEFRAME", "1h"),
+        atr_stop_multiplier=float(os.getenv("ATR_STOP_MULTIPLIER", str(ATR_STOP_MULTIPLIER))),
+        atr_profit_multiplier=float(
+            os.getenv("ATR_PROFIT_MULTIPLIER", str(ATR_PROFIT_MULTIPLIER))
+        ),
+        spot_long_only=_env_bool("SPOT_LONG_ONLY", SPOT_LONG_ONLY),
+        timeframe=os.getenv("TIMEFRAME", trigger),
         candle_limit=int(os.getenv("CANDLE_LIMIT", "500")),
         paper_starting_balance=float(os.getenv("PAPER_STARTING_BALANCE", "10000")),
         webhook_host=os.getenv("WEBHOOK_HOST", "127.0.0.1"),

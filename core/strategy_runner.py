@@ -1,12 +1,11 @@
-"""Native paper-trading loop: candles -> ema_atr_trend rules -> Gemini -> CSV.
+"""Native paper-trading loop: 1h macro + 15m trigger -> Gemini -> CSV.
 
-TradingView is not required. Each cycle fetches live OHLCV, evaluates the same
-regime-gated EMA crossover the Pine strategy uses, and asks Gemini to confirm
-entries. Open positions are managed locally against the ATR stop, target, and
-armed trailing stop.
+Each cycle fetches 1h candles for the trend filter and 15m candles for the
+pullback entry. Longs only fire when the 1h regime is BULL and 15m EMA 9
+crosses above EMA 21. Stops and targets are 15m ATR multiples.
 
     python -m core.strategy_runner --once
-    python -m core.strategy_runner --poll-interval 60
+    python -m core.strategy_runner --poll-interval 30
 """
 
 from __future__ import annotations
@@ -28,22 +27,40 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.config import (
+    ATR_PROFIT_MULTIPLIER,
+    ATR_STOP_MULTIPLIER,
+    MACRO_ADX_THRESHOLD,
+    MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
+    POLL_INTERVAL_SECONDS,
     POSITION_SIZE_FRACTION,
+    SPOT_LONG_ONLY,
     TRADING_PAIRS,
+    TRIGGER_TIMEFRAME,
+    dump_runner_state,
     empty_position_book,
+    empty_position_slot,
     get_settings,
+    hydrate_position_slot,
     legacy_open_slot,
+    migrate_circuit_breaker,
     migrate_position_book,
 )
 from core.gemini_agent import Decision, GeminiAgent
-from core.market_data import add_indicators, fetch_ohlcv, latest_snapshot
+from core.market_data import (
+    add_macro_indicators,
+    add_trigger_indicators,
+    classify_macro_regime,
+    fetch_ohlcv,
+)
 from strategies import load_strategy
 
 log = logging.getLogger("runner")
 
 STRATEGY_NAME = "ema_atr_trend"
 CANDLE_LIMIT = 400
+MACRO_CANDLES = 250
+TRIGGER_CANDLES = 100
 
 TRADE_LOG_FIELDS = [
     "timestamp", "symbol", "action", "entry_price", "stop_loss", "take_profit",
@@ -98,7 +115,7 @@ class Position:
 class Exit:
     price: float
     reason: str
-    hit: Literal["stop", "target"]
+    hit: Literal["stop", "target", "regime"]
 
 
 @dataclass
@@ -143,6 +160,7 @@ class CycleReport:
     equity: float | None = None
     legs: list["CycleReport"] = field(default_factory=list)
     book: dict[str, str] = field(default_factory=dict)
+    macro_regime: str = "NEUTRAL"
 
 
 def timeframe_delta(timeframe: str) -> pd.Timedelta:
@@ -235,6 +253,97 @@ def detect_signal(closed: pd.DataFrame, params: dict[str, Any], breaker_active: 
             adx=adx,
             macro_ema=macro,
         )
+    return None
+
+
+def detect_trigger(
+    closed: pd.DataFrame,
+    *,
+    stop_mult: float = ATR_STOP_MULTIPLIER,
+    target_mult: float = ATR_PROFIT_MULTIPLIER,
+) -> Signal | None:
+    """15m EMA 9/21 cross-up on a closed bar, with close still above EMA 21."""
+    if len(closed) < 2:
+        return None
+    prev, curr = closed.iloc[-2], closed.iloc[-1]
+    if not _finite(prev, "ema_fast", "ema_slow") or not _finite(curr, "ema_fast", "ema_slow", "close", "atr"):
+        return None
+    crossed_up = (
+        float(prev["ema_fast"]) <= float(prev["ema_slow"])
+        and float(curr["ema_fast"]) > float(curr["ema_slow"])
+    )
+    close = float(curr["close"])
+    ema21 = float(curr["ema_slow"])
+    if not (crossed_up and close > ema21):
+        return None
+    atr = float(curr["atr"])
+    return Signal(
+        action="BUY",
+        reason="mtf_15m_ema_cross_long",
+        price=close,
+        atr=atr,
+        stop=close - atr * stop_mult,
+        target=close + atr * target_mult,
+        adx=0.0,
+        macro_ema=0.0,
+    )
+
+
+def mtf_snapshot(
+    symbol: str,
+    macro_bar: pd.Series,
+    trigger_bar: pd.Series,
+    regime: str,
+) -> dict[str, Any]:
+    direction = {"BULL": "long_only", "BEAR": "short_only", "NEUTRAL": "none"}.get(regime, "unknown")
+    adx = float(macro_bar["adx"]) if _finite(macro_bar, "adx") else None
+    macro_ema = float(macro_bar["ema_macro"]) if _finite(macro_bar, "ema_macro") else None
+    return {
+        "symbol": symbol,
+        "last_close": float(trigger_bar["close"]),
+        "macro": {
+            "timeframe": MACRO_TIMEFRAME,
+            "close": float(macro_bar["close"]),
+            "ema_21": float(macro_bar["ema_fast"]) if _finite(macro_bar, "ema_fast") else None,
+            "ema_55": float(macro_bar["ema_slow"]) if _finite(macro_bar, "ema_slow") else None,
+            "ema_200": macro_ema,
+            "adx": adx,
+            "regime": regime,
+        },
+        "trigger": {
+            "timeframe": TRIGGER_TIMEFRAME,
+            "close": float(trigger_bar["close"]),
+            "ema_9": float(trigger_bar["ema_fast"]) if _finite(trigger_bar, "ema_fast") else None,
+            "ema_21": float(trigger_bar["ema_slow"]) if _finite(trigger_bar, "ema_slow") else None,
+            "atr": float(trigger_bar["atr"]) if _finite(trigger_bar, "atr") else None,
+        },
+        "regime": {
+            "macro_trend": "chop" if regime == "NEUTRAL" else regime.lower(),
+            "tradeable_direction": direction,
+            "adx": adx,
+            "adx_min": MACRO_ADX_THRESHOLD,
+            "macro_ema": macro_ema,
+            "trend_strength": "weak" if regime == "NEUTRAL" else "strong",
+        },
+        "tradingview_alert": None,
+    }
+
+
+def mtf_maybe_exit(
+    position: Position,
+    high: float,
+    low: float,
+    close: float,
+    regime: str,
+) -> Exit | None:
+    """15m stop / target, then a BEAR flip while long."""
+    if position.side == "LONG":
+        if low <= position.stop:
+            return Exit(price=position.stop, reason="atr_stop_long", hit="stop")
+        if high >= position.target:
+            return Exit(price=position.target, reason="atr_target_long", hit="target")
+        if regime == "BEAR":
+            return Exit(price=close, reason="macro_regime_exit", hit="regime")
     return None
 
 
@@ -363,14 +472,21 @@ def append_row(path: Path, row: dict[str, Any]) -> None:
 
 
 def _position_from_dict(raw: dict[str, Any] | None) -> Position | None:
-    """Rehydrate a Position, ignoring book-only keys like status/symbol."""
+    """Rehydrate a Position from an MTF slot or a legacy runner slot."""
     if not raw:
         return None
-    status = str(raw.get("status") or raw.get("side") or "FLAT").upper()
+    payload = hydrate_position_slot(raw)
+    status = str(payload.get("status") or payload.get("side") or "FLAT").upper()
     if status in {"", "FLAT"}:
         return None
-    payload = dict(raw)
     payload.setdefault("side", status)
+    payload.setdefault("entry_atr", payload.get("entry_atr") or 0.0)
+    payload.setdefault("trail_armed", bool(payload.get("trail_armed") or False))
+    payload.setdefault("opened_bar", payload.get("entry_time") or "")
+    payload.setdefault("confidence", payload.get("confidence") or 0.0)
+    payload.setdefault("model", payload.get("model"))
+    payload.setdefault("rationale", payload.get("rationale") or "")
+    payload.setdefault("reason", payload.get("reason") or "")
     allowed = {item.name for item in fields(Position)}
     try:
         return Position(**{key: payload[key] for key in allowed if key in payload})
@@ -431,7 +547,7 @@ class StrategyRunner:
     ) -> None:
         self._settings = None
         self.fetch_fn = fetch_fn or fetch_ohlcv
-        self.indicate_fn = indicate_fn or add_indicators
+        self.indicate_fn = indicate_fn
         self.candle_limit = candle_limit
         self._agent = agent
         self._params = params
@@ -442,14 +558,26 @@ class StrategyRunner:
             self.pairs = tuple(pairs)
             self.max_open_positions = MAX_OPEN_POSITIONS
             self.position_size_fraction = POSITION_SIZE_FRACTION
+            self.spot_long_only = SPOT_LONG_ONLY
+            self.macro_timeframe = MACRO_TIMEFRAME
+            self.trigger_timeframe = TRIGGER_TIMEFRAME
+            self.atr_stop_mult = ATR_STOP_MULTIPLIER
+            self.atr_profit_mult = ATR_PROFIT_MULTIPLIER
+            self.adx_threshold = MACRO_ADX_THRESHOLD
         else:
             self.pairs = tuple(self.settings.trading_pairs or TRADING_PAIRS)
             self.max_open_positions = int(self.settings.max_open_positions or MAX_OPEN_POSITIONS)
             self.position_size_fraction = float(
                 self.settings.position_size_fraction or POSITION_SIZE_FRACTION
             )
+            self.spot_long_only = bool(self.settings.spot_long_only)
+            self.macro_timeframe = self.settings.macro_timeframe or MACRO_TIMEFRAME
+            self.trigger_timeframe = self.settings.trigger_timeframe or TRIGGER_TIMEFRAME
+            self.atr_stop_mult = float(self.settings.atr_stop_multiplier or ATR_STOP_MULTIPLIER)
+            self.atr_profit_mult = float(self.settings.atr_profit_multiplier or ATR_PROFIT_MULTIPLIER)
+            self.adx_threshold = float(self.settings.macro_adx_threshold or MACRO_ADX_THRESHOLD)
         self.fetch_delay = 1.0 if fetch_delay is None else max(0.0, float(fetch_delay))
-        self.timeframe = timeframe if timeframe is not None else self.settings.timeframe
+        self.timeframe = timeframe if timeframe is not None else self.trigger_timeframe
         self.exchange_id = exchange_id if exchange_id is not None else self.settings.exchange_id
         self.min_confidence = (
             min_confidence if min_confidence is not None else self.settings.min_confidence
@@ -487,14 +615,36 @@ class StrategyRunner:
             self._agent = GeminiAgent()
         return self._agent
 
-    def _fetch_pair(self, symbol: str) -> pd.DataFrame:
-        return self.indicate_fn(
+    def _pace(self) -> None:
+        if self.fetch_delay > 0:
+            time.sleep(self.fetch_delay)
+
+    def _indicate(self, frame: pd.DataFrame, kind: Literal["macro", "trigger"]) -> pd.DataFrame:
+        if self.indicate_fn is not None:
+            return self.indicate_fn(frame)
+        if kind == "macro":
+            return add_macro_indicators(frame)
+        return add_trigger_indicators(frame)
+
+    def _fetch_tf(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        kind: Literal["macro", "trigger"],
+        *,
+        paced: bool,
+    ) -> pd.DataFrame:
+        if paced:
+            self._pace()
+        return self._indicate(
             self.fetch_fn(
                 symbol=symbol,
-                timeframe=self.timeframe,
-                limit=self.candle_limit,
+                timeframe=timeframe,
+                limit=limit,
                 exchange_id=self.exchange_id,
-            )
+            ),
+            kind,
         )
 
     def _load_state(self) -> RunnerState:
@@ -502,14 +652,15 @@ class StrategyRunner:
         if self.state_path.exists():
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
             positions = migrate_position_book(raw, pairs)
+            breaker = migrate_circuit_breaker(raw)
             last_bars = dict(raw.get("last_bars") or {})
             if raw.get("last_bar") and not last_bars:
                 last_bars = {symbol: raw["last_bar"] for symbol in pairs}
             return RunnerState(
                 equity=float(raw.get("equity", self.starting_equity)),
                 equity_history=list(raw.get("equity_history") or []),
-                loss_streak=int(raw.get("loss_streak") or 0),
-                breaker_active=bool(raw.get("breaker_active") or False),
+                loss_streak=int(breaker["loss_streak"]),
+                breaker_active=bool(breaker["tripped"]),
                 breaker_bars=int(raw.get("breaker_bars") or 0),
                 last_bar=raw.get("last_bar"),
                 last_bars=last_bars,
@@ -523,8 +674,21 @@ class StrategyRunner:
             self.state.positions = empty_position_book(self.pairs)
         self.state.position = legacy_open_slot(self.state.positions)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dump_runner_state(
+            equity=self.state.equity,
+            positions=self.state.positions,
+            circuit_breaker={
+                "loss_streak": self.state.loss_streak,
+                "tripped": self.state.breaker_active,
+            },
+            equity_history=self.state.equity_history,
+            last_bar=self.state.last_bar,
+            last_bars=self.state.last_bars,
+            breaker_bars=self.state.breaker_bars,
+            pairs=self.pairs,
+        )
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self.state), indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
 
     def _base_row(
@@ -558,7 +722,10 @@ class StrategyRunner:
         pnl = close_pnl(position, exit_event.price, float(self.params.get("commission_pct", 0.075)))
         self.state.equity += pnl
         self.state.loss_streak = self.state.loss_streak + 1 if pnl < 0 else 0
-        self.state.positions[symbol] = {"status": "FLAT"}
+        previous = self.state.positions.get(symbol) or {}
+        self.state.positions[symbol] = empty_position_slot(
+            macro_regime=str(previous.get("macro_regime") or "UNKNOWN")
+        )
         self.state.position = legacy_open_slot(self.state.positions)
         adx = bar["adx"] if "adx" in bar.index else None
         macro = bar["ema_macro"] if "ema_macro" in bar.index else None
@@ -585,9 +752,16 @@ class StrategyRunner:
         )
         return str(self.trade_log)
 
-    def _open_position(self, symbol: str, signal: Signal, decision: Decision, opened_bar: str) -> Position:
-        stop = decision.stop_loss if decision.stop_loss is not None else signal.stop
-        target = decision.take_profit if decision.take_profit is not None else signal.target
+    def _open_position(
+        self,
+        symbol: str,
+        signal: Signal,
+        decision: Decision,
+        opened_bar: str,
+        macro_regime: str,
+    ) -> Position:
+        stop = signal.stop
+        target = signal.target
         qty = fraction_qty(self.state.equity, signal.price, self.position_size_fraction)
         side: Literal["LONG", "SHORT"] = "LONG" if signal.action == "BUY" else "SHORT"
         position = Position(
@@ -605,7 +779,18 @@ class StrategyRunner:
             rationale=decision.rationale,
             reason=signal.reason,
         )
-        self.state.positions[symbol] = {**asdict(position), "status": side, "symbol": symbol}
+        self.state.positions[symbol] = hydrate_position_slot(
+            {
+                **asdict(position),
+                "status": side,
+                "symbol": symbol,
+                "size": qty,
+                "stop_loss": float(stop),
+                "take_profit": float(target),
+                "entry_time": opened_bar,
+                "macro_regime": macro_regime,
+            }
+        )
         self.state.position = legacy_open_slot(self.state.positions)
         return position
 
@@ -640,40 +825,60 @@ class StrategyRunner:
         return bars
 
     def cycle(self, *, consult_always: bool = False, now: pd.Timestamp | None = None) -> CycleReport:
-        """Evaluate every pair, manage exits, then open new slots up to the cap."""
+        """Evaluate every pair on 1h macro + 15m trigger, then manage the book."""
         if not self.state.positions:
             self.state.positions = empty_position_book(self.pairs)
         for symbol in self.pairs:
-            self.state.positions.setdefault(symbol, {"status": "FLAT"})
+            self.state.positions.setdefault(symbol, empty_position_slot())
 
         prepared: list[dict[str, Any]] = []
-        for index, symbol in enumerate(self.pairs):
-            if index > 0 and self.fetch_delay > 0:
-                time.sleep(self.fetch_delay)
-            frame = self._fetch_pair(symbol)
-            closed_ts = last_closed_ts(frame, self.timeframe, now=now)
-            closed = frame.loc[:closed_ts]
-            live = frame.iloc[-1]
-            last = closed.iloc[-1]
-            snapshot = latest_snapshot(closed)
-            snapshot["tradingview_alert"] = None
-            bar_iso = closed_ts.isoformat()
-            use_adx = bool(self.params.get("use_adx_filter", True))
-            adx_min = float(self.params.get("adx_min", 20))
+        fetch_index = 0
+        for symbol in self.pairs:
+            macro_frame = self._fetch_tf(
+                symbol,
+                self.macro_timeframe,
+                MACRO_CANDLES,
+                "macro",
+                paced=fetch_index > 0,
+            )
+            fetch_index += 1
+            trigger_frame = self._fetch_tf(
+                symbol,
+                self.trigger_timeframe,
+                TRIGGER_CANDLES,
+                "trigger",
+                paced=fetch_index > 0,
+            )
+            fetch_index += 1
+
+            macro_ts = last_closed_ts(macro_frame, self.macro_timeframe, now=now)
+            trigger_ts = last_closed_ts(trigger_frame, self.trigger_timeframe, now=now)
+            macro_closed = macro_frame.loc[:macro_ts]
+            trigger_closed = trigger_frame.loc[:trigger_ts]
+            macro_last = macro_closed.iloc[-1]
+            trigger_last = trigger_closed.iloc[-1]
+            trigger_live = trigger_frame.iloc[-1]
+            regime = classify_macro_regime(macro_last, self.adx_threshold)
+            snapshot = mtf_snapshot(symbol, macro_last, trigger_last, regime)
+            bar_iso = trigger_ts.isoformat()
+            slot = self.state.positions.get(symbol) or empty_position_slot()
+            slot["macro_regime"] = regime
+            self.state.positions[symbol] = slot
             prepared.append(
                 {
                     "symbol": symbol,
-                    "closed_ts": closed_ts,
-                    "closed": closed,
-                    "live": live,
-                    "last": last,
+                    "closed_ts": trigger_ts,
+                    "closed": trigger_closed,
+                    "live": trigger_live,
+                    "last": trigger_last,
+                    "macro_last": macro_last,
                     "snapshot": snapshot,
                     "bar_iso": bar_iso,
                     "new_bar": self.state.last_bars.get(symbol) != bar_iso,
-                    "trend_strong": (not use_adx)
-                    or (pd.notna(last.get("adx")) and float(last["adx"]) > adx_min),
+                    "macro_regime": regime,
+                    "trend_strong": regime != "NEUTRAL",
                     "signal": None,
-                    "position": _position_from_dict(self.state.positions.get(symbol)),
+                    "position": _position_from_dict(slot),
                     "verdict": None,
                     "reason": "flat_no_signal",
                     "gemini": None,
@@ -688,23 +893,23 @@ class StrategyRunner:
             exit_event = None
             exit_bar = item["live"]
             for bar in self._exit_bars(position, item["last"], item["live"]):
-                atr = float(bar["atr"]) if pd.notna(bar.get("atr")) else position.entry_atr
-                exit_event = maybe_exit(
+                exit_event = mtf_maybe_exit(
                     position,
                     high=float(bar["high"]),
                     low=float(bar["low"]),
                     close=float(bar["close"]),
-                    atr=atr,
-                    params=self.params,
+                    regime=item["macro_regime"],
                 )
-                self.state.positions[item["symbol"]] = {
-                    **asdict(position),
-                    "status": position.side,
-                    "symbol": item["symbol"],
-                }
                 if exit_event is not None:
                     exit_bar = bar
                     break
+            if exit_event is None and item["macro_regime"] == "BEAR" and position.side == "LONG":
+                exit_event = Exit(
+                    price=float(item["last"]["close"]),
+                    reason="macro_regime_exit",
+                    hit="regime",
+                )
+                exit_bar = item["last"]
             if exit_event is not None:
                 item["logged"] = self._close_position(item["symbol"], position, exit_event, exit_bar)
                 item["position"] = None
@@ -724,16 +929,39 @@ class StrategyRunner:
 
         consulted = False
         for item in prepared:
-            if item["position"] is not None:
+            if item["position"] is not None or item["verdict"] is not None:
                 continue
-            signal = detect_signal(item["closed"], self.params, self.state.breaker_active)
+            if self.state.breaker_active:
+                raw_signal = detect_trigger(
+                    item["closed"],
+                    stop_mult=self.atr_stop_mult,
+                    target_mult=self.atr_profit_mult,
+                )
+                if raw_signal is not None and item["macro_regime"] == "BULL":
+                    item["reason"] = "circuit_breaker_active"
+                continue
+
+            if item["macro_regime"] != "BULL":
+                item["reason"] = f"macro_{item['macro_regime'].lower()}"
+                continue
+
+            signal = detect_trigger(
+                item["closed"],
+                stop_mult=self.atr_stop_mult,
+                target_mult=self.atr_profit_mult,
+            )
             item["signal"] = signal
-            if (
-                signal is None
-                and self.state.breaker_active
-                and detect_signal(item["closed"], self.params, False) is not None
-            ):
-                item["reason"] = "circuit_breaker_active"
+            if signal is not None:
+                signal.adx = (
+                    float(item["macro_last"]["adx"])
+                    if _finite(item["macro_last"], "adx")
+                    else 0.0
+                )
+                signal.macro_ema = (
+                    float(item["macro_last"]["ema_macro"])
+                    if _finite(item["macro_last"], "ema_macro")
+                    else 0.0
+                )
 
             if signal is not None and item["new_bar"]:
                 if count_open_positions(self.state.positions) >= self.max_open_positions:
@@ -747,6 +975,7 @@ class StrategyRunner:
                     "strategy_target": signal.target,
                     "loss_streak": self.state.loss_streak,
                     "breaker_active": self.state.breaker_active,
+                    "macro_regime": item["macro_regime"],
                 }
                 verdict, reason, gemini = self._confirm(signal, snapshot)
                 consulted = True
@@ -762,11 +991,13 @@ class StrategyRunner:
                     "alert_reason": signal.reason,
                     "adx": signal.adx,
                     "macro_ema": signal.macro_ema,
-                    "stop_loss": signal.stop if gemini is None else (gemini.stop_loss or signal.stop),
-                    "take_profit": signal.target if gemini is None else (gemini.take_profit or signal.target),
+                    "stop_loss": signal.stop,
+                    "take_profit": signal.target,
                 }
                 if verdict == "CONFIRMED" and gemini is not None:
-                    position = self._open_position(item["symbol"], signal, gemini, item["bar_iso"])
+                    position = self._open_position(
+                        item["symbol"], signal, gemini, item["bar_iso"], item["macro_regime"]
+                    )
                     item["position"] = position
                     extra["stop_loss"] = position.stop
                     extra["take_profit"] = position.target
@@ -788,9 +1019,6 @@ class StrategyRunner:
             elif signal is not None:
                 item["reason"] = "signal_already_processed"
 
-        consult_gemini: Decision | None = next(
-            (item["gemini"] for item in prepared if item["gemini"] is not None), None
-        )
         if consult_always and not consulted:
             snapshot = prepared[0]["snapshot"] if prepared else {}
             try:
@@ -838,7 +1066,7 @@ class StrategyRunner:
         snapshot: dict[str, Any] = item["snapshot"]
         return CycleReport(
             symbol=item["symbol"],
-            timeframe=self.timeframe,
+            timeframe=self.trigger_timeframe,
             exchange=self.exchange_id,
             bar=item["bar_iso"],
             close=float(last["close"]),
@@ -855,10 +1083,11 @@ class StrategyRunner:
             gemini_confidence=None if gemini is None else gemini.confidence,
             gemini_rationale=None if gemini is None else gemini.rationale,
             model=getattr(self._agent, "last_model_used", None),
-            stop=None if position is None else position.trail_stop,
+            stop=None if position is None else position.stop,
             target=None if position is None else position.target,
             logged_to=item["logged"],
             equity=self.state.equity,
+            macro_regime=item["macro_regime"],
         )
 
 
@@ -870,7 +1099,7 @@ def _format_leg(report: CycleReport) -> list[str]:
         f"bar        : {report.bar} ({'new close' if report.new_bar else 'already processed'})",
         f"close      : {report.close}",
         (
-            f"regime     : {regime.get('macro_trend')} / {regime.get('trend_strength')}"
+            f"regime     : {report.macro_regime} / {regime.get('trend_strength')}"
             f" (ADX {regime.get('adx')}, EMA200 {regime.get('macro_ema')},"
             f" dir={regime.get('tradeable_direction')})"
         ),
@@ -888,7 +1117,7 @@ def format_report(report: CycleReport) -> str:
     equity = "n/a" if report.equity is None else f"{report.equity:.2f}"
     universe = " ".join(report.book) if report.book else report.symbol
     lines = [
-        f"=== Gemini Trend Guard | {universe} {report.timeframe} @ {report.exchange} ===",
+        f"=== Gemini Trend Guard | {universe} 1h/15m @ {report.exchange} ===",
         f"breaker    : {'ON' if report.breaker_active else 'off'} (streak {report.loss_streak})",
         f"equity     : {equity}",
         f"model      : {report.model or '—'}",
@@ -915,15 +1144,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--poll-interval",
         type=int,
-        default=60,
+        default=POLL_INTERVAL_SECONDS,
         metavar="SECONDS",
         help=(
-            "Seconds between cycles in continuous mode (default: 60). Entries fire "
-            "only on a new closed 1h bar; polls also catch intra-bar stop/target hits."
+            "Seconds between cycles in continuous mode (default: 30). Entries fire "
+            "on a new closed trigger bar; polls also catch intra-bar stop/target hits."
         ),
     )
     parser.add_argument("--symbol", default=None, help="Override SYMBOL (default from .env, BTC/USDT)")
-    parser.add_argument("--timeframe", default=None, help="Override TIMEFRAME (default 1h)")
+    parser.add_argument("--timeframe", default=None, help="Override trigger timeframe (default 15m)")
     parser.add_argument("--exchange", default=None, help="Override EXCHANGE_ID (default kraken)")
     return parser.parse_args(argv)
 
@@ -948,8 +1177,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        f"Polling every {args.poll_interval}s | {' '.join(runner.pairs)} {runner.timeframe} "
-        f"@ {runner.exchange_id} | cap={runner.max_open_positions} | Ctrl+C to stop"
+        f"Polling every {args.poll_interval}s | {' '.join(runner.pairs)} "
+        f"{runner.macro_timeframe}/{runner.trigger_timeframe} @ {runner.exchange_id} "
+        f"| cap={runner.max_open_positions} | Ctrl+C to stop"
     )
     while True:
         try:
