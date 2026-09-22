@@ -21,11 +21,13 @@ from core.config import (
     MAX_OPEN_POSITIONS,
     POLL_INTERVAL_SECONDS,
     POSITION_SIZE_FRACTION,
+    PAPER_TRADING,
     SPOT_LONG_ONLY,
     TRADING_PAIRS,
     TRIGGER_EMA_FAST,
     TRIGGER_EMA_SLOW,
     TRIGGER_TIMEFRAME,
+    USE_POST_ONLY,
     canonical_position_slot,
     dump_runner_state,
     empty_position_book,
@@ -50,6 +52,8 @@ def test_mtf_defaults() -> None:
     assert ATR_STOP_MULTIPLIER == 1.5
     assert ATR_PROFIT_MULTIPLIER == 3.5
     assert SPOT_LONG_ONLY is True
+    assert PAPER_TRADING is True
+    assert USE_POST_ONLY is True
     print("    MTF constants")
 
 

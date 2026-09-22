@@ -75,6 +75,12 @@ ATR_PROFIT_MULTIPLIER = 3.5
 #: Spot accounts cannot sell short. The runner skips SELL entries when True.
 SPOT_LONG_ONLY = True
 
+#: Stay on the paper book until the live deposit is confirmed.
+PAPER_TRADING = True
+
+#: Live entries are post-only limits at the 15m close (maker), not market takes.
+USE_POST_ONLY = True
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -101,6 +107,10 @@ class Settings:
     atr_stop_multiplier: float = ATR_STOP_MULTIPLIER
     atr_profit_multiplier: float = ATR_PROFIT_MULTIPLIER
     spot_long_only: bool = SPOT_LONG_ONLY
+    paper_trading: bool = PAPER_TRADING
+    use_post_only: bool = USE_POST_ONLY
+    exchange_api_key: str = ""
+    exchange_api_secret: str = ""
     timeframe: str = TRIGGER_TIMEFRAME
     candle_limit: int = 500
     paper_starting_balance: float = 10_000.0
@@ -336,6 +346,10 @@ def get_settings() -> Settings:
             os.getenv("ATR_PROFIT_MULTIPLIER", str(ATR_PROFIT_MULTIPLIER))
         ),
         spot_long_only=_env_bool("SPOT_LONG_ONLY", SPOT_LONG_ONLY),
+        paper_trading=_env_bool("PAPER_TRADING", PAPER_TRADING),
+        use_post_only=_env_bool("USE_POST_ONLY", USE_POST_ONLY),
+        exchange_api_key=(os.getenv("EXCHANGE_API_KEY") or "").strip(),
+        exchange_api_secret=(os.getenv("EXCHANGE_API_SECRET") or "").strip(),
         timeframe=os.getenv("TIMEFRAME", trigger),
         candle_limit=int(os.getenv("CANDLE_LIMIT", "500")),
         paper_starting_balance=float(os.getenv("PAPER_STARTING_BALANCE", "10000")),

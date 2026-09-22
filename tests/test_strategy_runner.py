@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.gemini_agent import Decision
+from core.broker import PairLimits, limits_from_market, prepare_order_size, truncate_qty
 from core.config import TRADING_PAIRS
 from core.market_data import classify_macro_regime
 from core.strategy_runner import (
@@ -28,6 +29,7 @@ from core.strategy_runner import (
     RunnerState,
     StrategyRunner,
     apply_breaker,
+    correlation_block_reason,
     count_open_positions,
     detect_signal,
     detect_trigger,
@@ -36,6 +38,7 @@ from core.strategy_runner import (
     maybe_exit,
     mtf_maybe_exit,
     position_qty,
+    select_alt_entry_winner,
     update_trail,
 )
 
@@ -118,8 +121,8 @@ def make_trigger_frame(rows: list[dict]) -> pd.DataFrame:
     return make_frame(rows, freq="15min", start=TRIGGER_START, timeframe="15m")
 
 
-def macro_bull_frame() -> pd.DataFrame:
-    bull = _row(10000, 100.5, 99.0, adx=25.0, ema_macro=9000)
+def macro_bull_frame(*, adx: float = 25.0) -> pd.DataFrame:
+    bull = _row(10000, 100.5, 99.0, adx=adx, ema_macro=9000)
     return make_frame([bull] * 6)
 
 
@@ -489,16 +492,21 @@ def test_once_consults_gemini_without_signal() -> None:
 def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     tmp = tmpdir()
     fetched: list[tuple[str, str]] = []
-    macro = macro_bull_frame()
+    # Equal ADX: alt winner is SOL (tie-break by symbol). BTC fills first.
+    macros = {
+        "BTC/USDT": macro_bull_frame(adx=25),
+        "ETH/USDT": macro_bull_frame(adx=25),
+        "SOL/USDT": macro_bull_frame(adx=25),
+    }
     trigger = trigger_cross_frame()
 
     def fetch(*, symbol: str, timeframe: str, **_k):
         fetched.append((symbol, timeframe))
-        return (macro if timeframe == "1h" else trigger).copy()
+        return (macros[symbol] if timeframe == "1h" else trigger).copy()
 
     agent = StubAgent("BUY", 0.9)
     runner = runner_for(
-        macro,
+        macros["BTC/USDT"],
         trigger,
         agent,
         tmp,
@@ -512,22 +520,114 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     ]
     assert len(report.legs) == 3
     assert report.book["BTC/USDT"] == "LONG"
-    assert report.book["ETH/USDT"] == "LONG"
-    assert report.book["SOL/USDT"] == "FLAT"
+    assert report.book["SOL/USDT"] == "LONG"
+    assert report.book["ETH/USDT"] == "FLAT"
     assert count_open_positions(runner.state.positions) == 2
-    sol = next(leg for leg in report.legs if leg.symbol == "SOL/USDT")
-    assert sol.reason == "max_open_positions"
-    assert sol.signal == "BUY"
+    eth = next(leg for leg in report.legs if leg.symbol == "ETH/USDT")
+    assert eth.reason == "alt_adx_priority"
+    assert eth.signal == "BUY"
     btc_qty = runner.state.positions["BTC/USDT"]["qty"]
     assert abs(btc_qty - 0.48) < 1e-9
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
     assert saved["circuit_breaker"]["tripped"] is False
     assert saved["positions"]["BTC/USDT"]["status"] == "LONG"
     assert saved["positions"]["BTC/USDT"]["size"] == btc_qty
-    assert saved["positions"]["ETH/USDT"]["status"] == "LONG"
-    assert saved["positions"]["SOL/USDT"]["status"] == "FLAT"
+    assert saved["positions"]["SOL/USDT"]["status"] == "LONG"
+    assert saved["positions"]["ETH/USDT"]["status"] == "FLAT"
     assert agent.calls == 2
-    print("    scanned 3 pairs x 2 timeframes, opened 2, sized 48%")
+    print("    scanned 3 pairs x 2 timeframes, opened BTC+SOL, sized 48%")
+
+
+def test_alt_correlation_blocks_second_alt() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    macros = {
+        "BTC/USDT": macro_bull_frame(adx=20),
+        "ETH/USDT": macro_bull_frame(adx=30),
+        "SOL/USDT": macro_bull_frame(adx=40),
+    }
+    trigger = trigger_cross_frame()
+
+    def fetch(*, symbol: str, timeframe: str, **_k):
+        return (macros[symbol] if timeframe == "1h" else trigger).copy()
+
+    # Seed an open ETH slot with room left under MAX_OPEN_POSITIONS.
+    runner = runner_for(
+        macros["BTC/USDT"],
+        trigger,
+        agent,
+        tmp,
+        fetch_fn=fetch,
+        pairs=TRADING_PAIRS,
+        fetch_delay=0,
+    )
+    runner.state.positions["ETH/USDT"] = {
+        "status": "LONG",
+        "side": "LONG",
+        "entry_price": 10000,
+        "size": 0.1,
+        "qty": 0.1,
+        "stop_loss": 9850,
+        "take_profit": 10350,
+        "stop": 9850,
+        "target": 10350,
+        "entry_time": "seed",
+        "opened_bar": "seed",
+        "macro_regime": "BULL",
+    }
+    report = runner.cycle(now=NOW)
+    assert report.book["ETH/USDT"] == "LONG"
+    assert report.book["BTC/USDT"] == "LONG"
+    assert report.book["SOL/USDT"] == "FLAT"
+    sol = next(leg for leg in report.legs if leg.symbol == "SOL/USDT")
+    assert sol.reason == "alt_correlation_cap"
+    assert correlation_block_reason("SOL/USDT", runner.state.positions) == "alt_correlation_cap"
+    print("    ETH open blocked SOL; BTC still filled")
+
+
+def test_same_bar_alts_prefer_higher_adx() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    # Flat BTC frame so only alts compete for a single open slot.
+    flat_btc = make_frame([_row(10000, 110, 100, adx=18, ema_macro=9000)] * 6)
+    macros = {
+        "BTC/USDT": flat_btc,
+        "ETH/USDT": macro_bull_frame(adx=22),
+        "SOL/USDT": macro_bull_frame(adx=35),
+    }
+    trigger = trigger_cross_frame()
+    flat_trigger = trigger_flat_frame()
+
+    def fetch(*, symbol: str, timeframe: str, **_k):
+        if timeframe == "1h":
+            return macros[symbol].copy()
+        if symbol == "BTC/USDT":
+            return flat_trigger.copy()
+        return trigger.copy()
+
+    runner = runner_for(
+        macros["BTC/USDT"],
+        trigger,
+        agent,
+        tmp,
+        fetch_fn=fetch,
+        pairs=TRADING_PAIRS,
+        fetch_delay=0,
+    )
+    report = runner.cycle(now=NOW)
+    assert report.book["SOL/USDT"] == "LONG"
+    assert report.book["ETH/USDT"] == "FLAT"
+    assert report.book["BTC/USDT"] == "FLAT"
+    eth = next(leg for leg in report.legs if leg.symbol == "ETH/USDT")
+    assert eth.reason == "alt_adx_priority"
+    winner = select_alt_entry_winner(
+        [
+            {"symbol": "ETH/USDT", "signal": type("S", (), {"adx": 22})()},
+            {"symbol": "SOL/USDT", "signal": type("S", (), {"adx": 35})()},
+        ]
+    )
+    assert winner is not None and winner["symbol"] == "SOL/USDT"
+    print("    same-bar alts: SOL (ADX 35) beat ETH (ADX 22)")
 
 
 def test_breaker_blocks_entry() -> None:
@@ -542,6 +642,186 @@ def test_breaker_blocks_entry() -> None:
     assert report.reason == "circuit_breaker_active"
     assert agent.calls == 0
     print("    breaker suppressed the long")
+
+
+def test_order_size_truncates_and_clamps() -> None:
+    assert truncate_qty(0.123456789, 5) == 0.12345
+    assert truncate_qty(1.999, 0) == 1.0
+    limits = PairLimits("BTC/USDT", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+    assert prepare_order_size(0.00012, limits) == 0.00012
+    assert prepare_order_size(0.00001, limits) is None
+    market = {
+        "info": {"ordermin": "0.002", "lot_decimals": "5", "pair_decimals": "2"},
+        "limits": {"amount": {"min": 0.01}},
+        "precision": {"amount": 8, "price": 1},
+    }
+    parsed = limits_from_market("ETH/USDT", market)
+    assert parsed.ordermin == 0.002
+    assert parsed.lot_decimals == 5
+    assert parsed.pair_decimals == 2
+    print("    truncate + AssetPairs parse")
+
+
+def test_below_ordermin_skips_entry() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    limits = {"BTC/USDT": PairLimits("BTC/USDT", ordermin=1.0, lot_decimals=8, pair_decimals=1)}
+    report = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        agent,
+        tmp,
+        pair_limits=limits,
+    ).cycle(now=NOW)
+    assert report.position == "FLAT"
+    assert report.reason == "below_ordermin"
+    assert agent.calls == 0
+    print("    below ordermin skipped")
+
+
+def test_live_syncs_balance_and_posts_limit() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        agent,
+        tmp,
+        paper_trading=False,
+        use_post_only=True,
+        balance_fn=lambda: 200.0,
+        order_fn=lambda *args: orders.append(args),
+        pair_limits={
+            "BTC/USDT": PairLimits("BTC/USDT", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+        },
+    )
+    assert runner.state.equity == 200.0
+    report = runner.cycle(now=NOW)
+    assert report.position == "LONG"
+    assert orders and orders[0][0] == "limit"
+    assert orders[0][1] == "buy"
+    assert orders[0][5] == {"postOnly": True}
+    expected = truncate_qty(200.0 * 0.48 / 10000.0, 8)
+    assert abs(runner.state.positions["BTC/USDT"]["size"] - expected) < 1e-12
+    print("    live balance sync + post-only limit")
+
+
+def test_paper_does_not_place_exchange_orders() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    agent = StubAgent("BUY", 0.9)
+    runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        agent,
+        tmp,
+        paper_trading=True,
+        order_fn=lambda *args: orders.append(args),
+    ).cycle(now=NOW)
+    assert orders == []
+    print("    paper path placed no exchange order")
+
+
+def test_restart_resumes_open_position_without_duplicate_entry() -> None:
+    """Simulate daemon crash mid-hold: reload state and continue managing stops."""
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    first = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
+    opened = first.cycle(now=NOW)
+    assert opened.position == "LONG"
+    assert first.state.positions["BTC/USDT"]["status"] == "LONG"
+    saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
+    assert saved["positions"]["BTC/USDT"]["status"] == "LONG"
+    assert saved["positions"]["BTC/USDT"]["stop_loss"] == 9850
+    assert saved["positions"]["BTC/USDT"]["take_profit"] == 10350
+    assert "BTC/USDT" in saved.get("last_bars", {})
+    equity_before = saved["equity"]
+
+    agent2 = StubAgent("BUY", 0.9)
+    restarted = runner_for(macro_bull_frame(), trigger_cross_frame(), agent2, tmp)
+    assert restarted.state.positions["BTC/USDT"]["status"] == "LONG"
+    assert abs(restarted.state.equity - equity_before) < 1e-9
+    assert restarted.state.last_bars.get("BTC/USDT") == saved["last_bars"]["BTC/USDT"]
+
+    # Same closed bar: must hold, not fire a second BUY.
+    again = restarted.cycle(now=NOW)
+    assert again.position == "LONG"
+    assert again.reason == "holding"
+    assert agent2.calls == 0
+    rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
+    assert len([r for r in rows if r["action"] == "BUY"]) == 1
+
+    # Next bar hits stop: recovery path still manages the open slot.
+    punched = trigger_cross_frame()
+    punched.loc[punched.index[6], ["low", "close", "high"]] = (9800, 9900, 10000)
+    extra = punched.copy()
+    extra.loc[pd.Timestamp("2026-01-01 05:45:00", tz="UTC")] = _row(9900, 100.4, 100, atr=100)
+    later = pd.Timestamp("2026-01-01 05:52:00", tz="UTC")
+    restarted.fetch_fn = lambda *, timeframe, **_k: (
+        macro_bull_frame() if timeframe == "1h" else extra
+    )
+    closed = restarted.cycle(now=later)
+    assert closed.reason == "atr_stop_long"
+    assert closed.position == "FLAT"
+    print("    restart held open slot, no duplicate entry, stop still worked")
+
+
+def test_live_missing_keys_fails_closed_on_startup() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+
+    def boom():
+        raise RuntimeError("EXCHANGE_API_KEY and EXCHANGE_API_SECRET are required for live trading")
+
+    try:
+        runner_for(
+            macro_bull_frame(),
+            trigger_cross_frame(),
+            agent,
+            tmp,
+            paper_trading=False,
+            balance_fn=boom,
+        )
+    except RuntimeError as exc:
+        assert "EXCHANGE_API_KEY" in str(exc) or "required" in str(exc).lower()
+        print("    live startup failed closed before orders")
+        return
+    raise AssertionError("expected live startup to raise when balance sync fails")
+
+
+def test_live_market_exit_on_stop() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        agent,
+        tmp,
+        paper_trading=False,
+        use_post_only=True,
+        balance_fn=lambda: 500.0,
+        order_fn=lambda *args: orders.append(args),
+        pair_limits={
+            "BTC/USDT": PairLimits("BTC/USDT", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+        },
+    )
+    runner.cycle(now=NOW)
+    assert orders and orders[0][0] == "limit" and orders[0][5].get("postOnly") is True
+
+    punched = trigger_cross_frame()
+    punched.loc[punched.index[6], ["low", "close", "high"]] = (9800, 9900, 10000)
+    extra = punched.copy()
+    extra.loc[pd.Timestamp("2026-01-01 05:45:00", tz="UTC")] = _row(9900, 100.4, 100, atr=100)
+    later = pd.Timestamp("2026-01-01 05:52:00", tz="UTC")
+    runner.fetch_fn = lambda *, timeframe, **_k: (
+        macro_bull_frame() if timeframe == "1h" else extra
+    )
+    report = runner.cycle(now=later)
+    assert report.reason == "atr_stop_long"
+    assert any(o[0] == "market" and o[1] == "sell" for o in orders)
+    print("    live stop routed as market sell")
 
 
 def test_bear_macro_blocks_trigger() -> None:
@@ -573,8 +853,17 @@ def main() -> int:
         ("regime flip exits long", test_regime_flip_exits_long),
         ("--once consults without signal", test_once_consults_gemini_without_signal),
         ("multi-pair scan + cap", test_multi_pair_scan_caps_opens_and_sizes),
+        ("alt correlation cap", test_alt_correlation_blocks_second_alt),
+        ("same-bar alt ADX priority", test_same_bar_alts_prefer_higher_adx),
         ("breaker blocks entry", test_breaker_blocks_entry),
         ("bear macro blocks trigger", test_bear_macro_blocks_trigger),
+        ("order size clamp", test_order_size_truncates_and_clamps),
+        ("below ordermin skip", test_below_ordermin_skips_entry),
+        ("live sync + post-only", test_live_syncs_balance_and_posts_limit),
+        ("paper places no order", test_paper_does_not_place_exchange_orders),
+        ("restart recovery", test_restart_resumes_open_position_without_duplicate_entry),
+        ("live missing keys fail closed", test_live_missing_keys_fails_closed_on_startup),
+        ("live market exit on stop", test_live_market_exit_on_stop),
     ]
     failures = 0
     for label, check in checks:

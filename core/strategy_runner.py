@@ -26,17 +26,29 @@ import pandas as pd
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.broker import (
+    PairLimits,
+    default_pair_limits,
+    fetch_quote_balance,
+    load_pair_limits,
+    place_limit_entry,
+    place_market_exit,
+    prepare_order_size,
+    truncate_price,
+)
 from core.config import (
     ATR_PROFIT_MULTIPLIER,
     ATR_STOP_MULTIPLIER,
     MACRO_ADX_THRESHOLD,
     MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
+    PAPER_TRADING,
     POLL_INTERVAL_SECONDS,
     POSITION_SIZE_FRACTION,
     SPOT_LONG_ONLY,
     TRADING_PAIRS,
     TRIGGER_TIMEFRAME,
+    USE_POST_ONLY,
     dump_runner_state,
     empty_position_book,
     empty_position_slot,
@@ -61,6 +73,10 @@ STRATEGY_NAME = "ema_atr_trend"
 CANDLE_LIMIT = 400
 MACRO_CANDLES = 250
 TRIGGER_CANDLES = 100
+
+#: Spot book: at most one of these alts can be open alongside BTC (or alone).
+ALT_SYMBOLS = frozenset({"ETH/USDT", "SOL/USDT"})
+BTC_SYMBOL = "BTC/USDT"
 
 TRADE_LOG_FIELDS = [
     "timestamp", "symbol", "action", "entry_price", "stop_loss", "take_profit",
@@ -503,6 +519,50 @@ def count_open_positions(positions: dict[str, dict[str, Any]]) -> int:
     return n
 
 
+def is_altcoin(symbol: str) -> bool:
+    return symbol in ALT_SYMBOLS
+
+
+def open_altcoins(positions: dict[str, dict[str, Any]]) -> list[str]:
+    open_alts: list[str] = []
+    for symbol, slot in positions.items():
+        status = str(slot.get("status") or slot.get("side") or "FLAT").upper()
+        if status not in {"", "FLAT"} and is_altcoin(symbol):
+            open_alts.append(symbol)
+    return open_alts
+
+
+def correlation_block_reason(symbol: str, positions: dict[str, dict[str, Any]]) -> str | None:
+    """Block a second altcoin when one alt slot is already filled.
+
+    Book shape is at most 1 BTC + 1 alt (ETH or SOL), never ETH+SOL together.
+    """
+    if not is_altcoin(symbol):
+        return None
+    open_alts = open_altcoins(positions)
+    if any(other != symbol for other in open_alts):
+        return "alt_correlation_cap"
+    return None
+
+
+def _macro_adx(item: dict[str, Any]) -> float:
+    signal = item.get("signal")
+    if signal is not None and getattr(signal, "adx", None) is not None:
+        return float(signal.adx)
+    macro = item.get("macro_last")
+    if macro is not None and _finite(macro, "adx"):
+        return float(macro["adx"])
+    return 0.0
+
+
+def select_alt_entry_winner(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """When several alts fire on the same cycle, keep the strongest 1h ADX."""
+    alts = [item for item in candidates if is_altcoin(item["symbol"])]
+    if not alts:
+        return None
+    return max(alts, key=lambda item: (_macro_adx(item), item["symbol"]))
+
+
 def fraction_qty(equity: float, price: float, fraction: float) -> float:
     """Notional = fraction * equity. Used instead of ATR risk sizing for the book."""
     if price <= 0 or fraction <= 0 or equity <= 0:
@@ -544,6 +604,11 @@ class StrategyRunner:
         state_path: Path | None = None,
         pairs: tuple[str, ...] | None = None,
         fetch_delay: float | None = None,
+        paper_trading: bool | None = None,
+        use_post_only: bool | None = None,
+        pair_limits: dict[str, PairLimits] | None = None,
+        balance_fn: Callable[[], float] | None = None,
+        order_fn: Callable[..., Any] | None = None,
     ) -> None:
         self._settings = None
         self.fetch_fn = fetch_fn or fetch_ohlcv
@@ -564,6 +629,8 @@ class StrategyRunner:
             self.atr_stop_mult = ATR_STOP_MULTIPLIER
             self.atr_profit_mult = ATR_PROFIT_MULTIPLIER
             self.adx_threshold = MACRO_ADX_THRESHOLD
+            self.paper_trading = PAPER_TRADING if paper_trading is None else bool(paper_trading)
+            self.use_post_only = USE_POST_ONLY if use_post_only is None else bool(use_post_only)
         else:
             self.pairs = tuple(self.settings.trading_pairs or TRADING_PAIRS)
             self.max_open_positions = int(self.settings.max_open_positions or MAX_OPEN_POSITIONS)
@@ -576,6 +643,12 @@ class StrategyRunner:
             self.atr_stop_mult = float(self.settings.atr_stop_multiplier or ATR_STOP_MULTIPLIER)
             self.atr_profit_mult = float(self.settings.atr_profit_multiplier or ATR_PROFIT_MULTIPLIER)
             self.adx_threshold = float(self.settings.macro_adx_threshold or MACRO_ADX_THRESHOLD)
+            self.paper_trading = (
+                bool(self.settings.paper_trading) if paper_trading is None else bool(paper_trading)
+            )
+            self.use_post_only = (
+                bool(self.settings.use_post_only) if use_post_only is None else bool(use_post_only)
+            )
         self.fetch_delay = 1.0 if fetch_delay is None else max(0.0, float(fetch_delay))
         self.timeframe = timeframe if timeframe is not None else self.trigger_timeframe
         self.exchange_id = exchange_id if exchange_id is not None else self.settings.exchange_id
@@ -591,7 +664,12 @@ class StrategyRunner:
         self.trade_log = trade_log or (data_dir / "paper_trades.csv")
         self.reject_log = reject_log or (data_dir / "rejected_alerts.csv")
         self.state_path = state_path or (self.settings.paths["root"] / "state" / "runner.json")
+        self.balance_fn = balance_fn
+        self.order_fn = order_fn
+        self.pair_limits = pair_limits if pair_limits is not None else self._load_pair_limits(pairs is None)
         self.state = self._load_state()
+        if not self.paper_trading:
+            self.sync_account_balance()
 
     @property
     def settings(self):
@@ -614,6 +692,86 @@ class StrategyRunner:
         if self._agent is None:
             self._agent = GeminiAgent()
         return self._agent
+
+    def _load_pair_limits(self, allow_network: bool) -> dict[str, PairLimits]:
+        if not allow_network:
+            return {symbol: default_pair_limits(symbol) for symbol in self.pairs}
+        try:
+            return load_pair_limits(self.pairs, self.exchange_id)
+        except Exception as exc:  # noqa: BLE001
+            if not self.paper_trading:
+                raise RuntimeError(f"AssetPairs lookup failed in live mode: {exc}") from exc
+            log.warning("AssetPairs lookup failed; paper defaults in use: %s", exc)
+            return {symbol: default_pair_limits(symbol) for symbol in self.pairs}
+
+    def pair_limit(self, symbol: str) -> PairLimits:
+        return self.pair_limits.get(symbol) or default_pair_limits(symbol)
+
+    def sized_qty(self, symbol: str, price: float) -> float | None:
+        raw = fraction_qty(self.state.equity, price, self.position_size_fraction)
+        return prepare_order_size(raw, self.pair_limit(symbol))
+
+    def sync_account_balance(self) -> float:
+        """Replace file equity with free USDT/USD from Kraken when live."""
+        if self.balance_fn is not None:
+            live = float(self.balance_fn())
+        else:
+            live = fetch_quote_balance(
+                self.exchange_id,
+                self.settings.exchange_api_key,
+                self.settings.exchange_api_secret,
+            )
+        prior = self.state.equity
+        self.state.equity = live
+        log.info("live quote balance %.4f (runner.json equity was %.4f)", live, prior)
+        if live <= 0:
+            log.warning("live USDT/USD free balance is 0; new entries will be skipped")
+        return live
+
+    def _submit_live_entry(self, symbol: str, qty: float, price: float) -> float | None:
+        limits = self.pair_limit(symbol)
+        limit_price = truncate_price(price, limits.pair_decimals)
+        try:
+            if self.order_fn is not None:
+                self.order_fn(
+                    "limit",
+                    "buy",
+                    symbol,
+                    qty,
+                    limit_price,
+                    {"postOnly": True} if self.use_post_only else {},
+                )
+            else:
+                place_limit_entry(
+                    self.exchange_id,
+                    self.settings.exchange_api_key,
+                    self.settings.exchange_api_secret,
+                    symbol,
+                    qty,
+                    limit_price,
+                    post_only=self.use_post_only,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.error("live entry rejected for %s: %s", symbol, exc)
+            return None
+        return qty
+
+    def _submit_live_exit(self, symbol: str, qty: float) -> bool:
+        try:
+            if self.order_fn is not None:
+                self.order_fn("market", "sell", symbol, qty, None, {})
+            else:
+                place_market_exit(
+                    self.exchange_id,
+                    self.settings.exchange_api_key,
+                    self.settings.exchange_api_secret,
+                    symbol,
+                    qty,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.error("live exit rejected for %s: %s", symbol, exc)
+            return False
+        return True
 
     def _pace(self) -> None:
         if self.fetch_delay > 0:
@@ -718,7 +876,9 @@ class StrategyRunner:
             "rationale": extra.get("rationale", ""),
         }
 
-    def _close_position(self, symbol: str, position: Position, exit_event: Exit, bar: pd.Series) -> str:
+    def _close_position(self, symbol: str, position: Position, exit_event: Exit, bar: pd.Series) -> str | None:
+        if not self.paper_trading and not self._submit_live_exit(symbol, position.qty):
+            return None
         pnl = close_pnl(position, exit_event.price, float(self.params.get("commission_pct", 0.075)))
         self.state.equity += pnl
         self.state.loss_streak = self.state.loss_streak + 1 if pnl < 0 else 0
@@ -759,10 +919,10 @@ class StrategyRunner:
         decision: Decision,
         opened_bar: str,
         macro_regime: str,
+        qty: float,
     ) -> Position:
         stop = signal.stop
         target = signal.target
-        qty = fraction_qty(self.state.equity, signal.price, self.position_size_fraction)
         side: Literal["LONG", "SHORT"] = "LONG" if signal.action == "BUY" else "SHORT"
         position = Position(
             side=side,
@@ -911,7 +1071,11 @@ class StrategyRunner:
                 )
                 exit_bar = item["last"]
             if exit_event is not None:
-                item["logged"] = self._close_position(item["symbol"], position, exit_event, exit_bar)
+                logged = self._close_position(item["symbol"], position, exit_event, exit_bar)
+                if logged is None:
+                    item["reason"] = "live_exit_rejected"
+                    continue
+                item["logged"] = logged
                 item["position"] = None
                 item["verdict"] = "CONFIRMED"
                 item["reason"] = exit_event.reason
@@ -928,6 +1092,7 @@ class StrategyRunner:
         apply_breaker(self.state, self.params, trend_strong, any_new_bar)
 
         consulted = False
+        entry_candidates: list[dict[str, Any]] = []
         for item in prepared:
             if item["position"] is not None or item["verdict"] is not None:
                 continue
@@ -963,61 +1128,99 @@ class StrategyRunner:
                     else 0.0
                 )
 
-            if signal is not None and item["new_bar"]:
-                if count_open_positions(self.state.positions) >= self.max_open_positions:
-                    item["reason"] = "max_open_positions"
-                    continue
-                snapshot = item["snapshot"]
-                snapshot["tradingview_alert"] = {
-                    "action": signal.action,
-                    "reason": signal.reason,
-                    "strategy_stop": signal.stop,
-                    "strategy_target": signal.target,
-                    "loss_streak": self.state.loss_streak,
-                    "breaker_active": self.state.breaker_active,
-                    "macro_regime": item["macro_regime"],
-                }
-                verdict, reason, gemini = self._confirm(signal, snapshot)
-                consulted = True
-                item["verdict"] = verdict
-                item["reason"] = reason
-                item["gemini"] = gemini
-                extra = {
-                    "verdict": verdict,
-                    "confidence": None if gemini is None else round(gemini.confidence, 4),
-                    "agent_action": None if gemini is None else gemini.action,
-                    "model": getattr(self.get_agent(), "last_model_used", None),
-                    "rationale": reason if gemini is None else gemini.rationale,
-                    "alert_reason": signal.reason,
-                    "adx": signal.adx,
-                    "macro_ema": signal.macro_ema,
-                    "stop_loss": signal.stop,
-                    "take_profit": signal.target,
-                }
-                if verdict == "CONFIRMED" and gemini is not None:
-                    position = self._open_position(
-                        item["symbol"], signal, gemini, item["bar_iso"], item["macro_regime"]
-                    )
-                    item["position"] = position
-                    extra["stop_loss"] = position.stop
-                    extra["take_profit"] = position.target
-                    append_row(
-                        self.trade_log,
-                        self._base_row(
-                            signal.action, signal.price, signal, extra, symbol=item["symbol"]
-                        ),
-                    )
-                    item["logged"] = str(self.trade_log)
-                else:
-                    append_row(
-                        self.reject_log,
-                        self._base_row(
-                            signal.action, signal.price, signal, extra, symbol=item["symbol"]
-                        ),
-                    )
-                    item["logged"] = str(self.reject_log)
-            elif signal is not None:
+            if signal is None:
+                continue
+            if not item["new_bar"]:
                 item["reason"] = "signal_already_processed"
+                continue
+            entry_candidates.append(item)
+
+        # Same-bar ETH+SOL: only the higher 1h ADX may compete for the single alt slot.
+        if not open_altcoins(self.state.positions):
+            alt_winner = select_alt_entry_winner(entry_candidates)
+            if alt_winner is not None:
+                for item in entry_candidates:
+                    if is_altcoin(item["symbol"]) and item is not alt_winner:
+                        item["reason"] = "alt_adx_priority"
+                entry_candidates = [
+                    item
+                    for item in entry_candidates
+                    if not is_altcoin(item["symbol"]) or item is alt_winner
+                ]
+
+        # Prefer BTC before the alt so a free book can fill 1 BTC + 1 alt in one cycle.
+        entry_candidates.sort(key=lambda item: (0 if item["symbol"] == BTC_SYMBOL else 1, item["symbol"]))
+
+        for item in entry_candidates:
+            signal = item["signal"]
+            if signal is None:
+                continue
+            blocked = correlation_block_reason(item["symbol"], self.state.positions)
+            if blocked is not None:
+                item["reason"] = blocked
+                continue
+            if count_open_positions(self.state.positions) >= self.max_open_positions:
+                item["reason"] = "max_open_positions"
+                continue
+            qty = self.sized_qty(item["symbol"], signal.price)
+            if qty is None:
+                item["reason"] = "below_ordermin"
+                continue
+            snapshot = item["snapshot"]
+            snapshot["tradingview_alert"] = {
+                "action": signal.action,
+                "reason": signal.reason,
+                "strategy_stop": signal.stop,
+                "strategy_target": signal.target,
+                "loss_streak": self.state.loss_streak,
+                "breaker_active": self.state.breaker_active,
+                "macro_regime": item["macro_regime"],
+            }
+            verdict, reason, gemini = self._confirm(signal, snapshot)
+            consulted = True
+            item["verdict"] = verdict
+            item["reason"] = reason
+            item["gemini"] = gemini
+            extra = {
+                "verdict": verdict,
+                "confidence": None if gemini is None else round(gemini.confidence, 4),
+                "agent_action": None if gemini is None else gemini.action,
+                "model": getattr(self.get_agent(), "last_model_used", None),
+                "rationale": reason if gemini is None else gemini.rationale,
+                "alert_reason": signal.reason,
+                "adx": signal.adx,
+                "macro_ema": signal.macro_ema,
+                "stop_loss": signal.stop,
+                "take_profit": signal.target,
+            }
+            if verdict == "CONFIRMED" and gemini is not None:
+                if not self.paper_trading:
+                    live_qty = self._submit_live_entry(item["symbol"], qty, signal.price)
+                    if live_qty is None:
+                        item["reason"] = "live_order_rejected"
+                        continue
+                    qty = live_qty
+                position = self._open_position(
+                    item["symbol"], signal, gemini, item["bar_iso"], item["macro_regime"], qty
+                )
+                item["position"] = position
+                extra["stop_loss"] = position.stop
+                extra["take_profit"] = position.target
+                append_row(
+                    self.trade_log,
+                    self._base_row(
+                        signal.action, signal.price, signal, extra, symbol=item["symbol"]
+                    ),
+                )
+                item["logged"] = str(self.trade_log)
+            else:
+                append_row(
+                    self.reject_log,
+                    self._base_row(
+                        signal.action, signal.price, signal, extra, symbol=item["symbol"]
+                    ),
+                )
+                item["logged"] = str(self.reject_log)
 
         if consult_always and not consulted:
             snapshot = prepared[0]["snapshot"] if prepared else {}
@@ -1179,7 +1382,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Polling every {args.poll_interval}s | {' '.join(runner.pairs)} "
         f"{runner.macro_timeframe}/{runner.trigger_timeframe} @ {runner.exchange_id} "
-        f"| cap={runner.max_open_positions} | Ctrl+C to stop"
+        f"| cap={runner.max_open_positions} "
+        f"| {'paper' if runner.paper_trading else 'LIVE'} | Ctrl+C to stop"
     )
     while True:
         try:
