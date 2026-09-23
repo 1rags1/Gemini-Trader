@@ -57,6 +57,25 @@ def test_mtf_defaults() -> None:
     print("    MTF constants")
 
 
+def test_free_quote_balance_prefers_usd_then_zusd() -> None:
+    from core.broker import free_quote_balance
+
+    assert free_quote_balance({"free": {"USD": 512.5, "USDT": 99.0}}) == 512.5
+    assert (
+        free_quote_balance(
+            {
+                "free": {},
+                "total": {},
+                "info": {"result": {"ZUSD": "498.25", "XXBT": "0.01"}},
+            }
+        )
+        == 498.25
+    )
+    assert free_quote_balance({"free": {"USDT": 100.0}}) == 100.0
+    assert free_quote_balance({"free": {}}) == 0.0
+    print("    USD/ZUSD quote balance parse")
+
+
 def test_empty_book_schema() -> None:
     book = empty_position_book()
     assert list(book) == list(TRADING_PAIRS)

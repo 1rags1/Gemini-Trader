@@ -712,7 +712,7 @@ class StrategyRunner:
         return prepare_order_size(raw, self.pair_limit(symbol))
 
     def sync_account_balance(self) -> float:
-        """Replace file equity with free USDT/USD from Kraken when live."""
+        """Replace file equity with free USD/ZUSD (then USDT) from Kraken when live."""
         if self.balance_fn is not None:
             live = float(self.balance_fn())
         else:
@@ -723,9 +723,9 @@ class StrategyRunner:
             )
         prior = self.state.equity
         self.state.equity = live
-        log.info("live quote balance %.4f (runner.json equity was %.4f)", live, prior)
+        log.info("live USD/ZUSD balance %.4f (runner.json equity was %.4f)", live, prior)
         if live <= 0:
-            log.warning("live USDT/USD free balance is 0; new entries will be skipped")
+            log.warning("live USD/ZUSD free balance is 0; new entries will be skipped")
         return live
 
     def _submit_live_entry(self, symbol: str, qty: float, price: float) -> float | None:

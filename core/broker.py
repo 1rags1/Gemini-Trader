@@ -16,8 +16,8 @@ from core.net import enable_os_trust_store
 
 log = logging.getLogger("broker")
 
-#: Prefer USD (spot funding), then USDT if that is what the account holds.
-QUOTE_CANDIDATES = ("USD", "USDT")
+#: Prefer USD funding. Include Kraken's legacy ZUSD code, then USDT.
+QUOTE_CANDIDATES = ("USD", "ZUSD", "USDT")
 
 
 @dataclass(frozen=True)
@@ -117,21 +117,29 @@ def load_pair_limits(
 
 
 def free_quote_balance(balance: dict[str, Any]) -> float:
-    """Prefer free USD, then USDT, from a ccxt `fetch_balance()` payload."""
+    """Prefer free USD/ZUSD, then USDT, from a ccxt `fetch_balance()` payload.
+
+    ccxt usually normalizes Kraken `ZUSD` → `USD`. We still scan the raw
+    `info.result` map so a legacy key cannot be missed on live startup.
+    """
     free = balance.get("free") if isinstance(balance.get("free"), dict) else {}
     total = balance.get("total") if isinstance(balance.get("total"), dict) else {}
+    info = balance.get("info") if isinstance(balance.get("info"), dict) else {}
+    raw_result = info.get("result") if isinstance(info.get("result"), dict) else {}
+
     for currency in QUOTE_CANDIDATES:
-        raw = free.get(currency)
-        if raw is None:
-            raw = total.get(currency)
-        if raw is None and isinstance(balance.get(currency), dict):
-            raw = balance[currency].get("free", balance[currency].get("total"))
-        try:
-            amount = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if amount > 0:
-            return amount
+        for mapping in (free, total, balance, raw_result):
+            if not isinstance(mapping, dict):
+                continue
+            raw = mapping.get(currency)
+            if isinstance(raw, dict):
+                raw = raw.get("free", raw.get("total"))
+            try:
+                amount = float(raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if amount > 0:
+                return amount
     return 0.0
 
 
