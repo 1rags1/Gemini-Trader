@@ -275,6 +275,7 @@ def dump_runner_state(
     start_equity: float | None = None,
     pairs: tuple[str, ...] | None = None,
     pending_orders: dict[str, dict] | None = None,
+    book_name: str | None = None,
 ) -> dict[str, Any]:
     """Serialize runner state in the MTF schema.
 
@@ -306,7 +307,35 @@ def dump_runner_state(
             for symbol, record in pending_orders.items()
             if isinstance(record, dict)
         }
+    if book_name in {"paper", "live"}:
+        payload["book"] = book_name
     return payload
+
+
+def classify_book(raw: dict[str, Any] | None, paper_starting_balance: float) -> str:
+    """Tell a practice book from a live Kraken baseline.
+
+    An explicit ``book`` stamp wins. Otherwise a start equity at the configured
+    paper balance is the practice book, and a start equity below half of that
+    balance is a live deposit (the usual $10,000 vs ~$500 split).
+    """
+    if not isinstance(raw, dict):
+        return "unknown"
+    stamped = str(raw.get("book") or "").strip().lower()
+    if stamped in {"paper", "live"}:
+        return stamped
+    try:
+        start = float(raw["start_equity"]) if raw.get("start_equity") is not None else None
+    except (TypeError, ValueError):
+        start = None
+    baseline = float(paper_starting_balance or 0)
+    if start is None or baseline <= 0:
+        return "unknown"
+    if start >= baseline * 0.99:
+        return "paper"
+    if start < baseline * 0.5:
+        return "live"
+    return "unknown"
 
 
 def legacy_open_slot(positions: dict[str, dict]) -> dict | None:

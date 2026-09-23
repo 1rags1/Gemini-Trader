@@ -32,16 +32,19 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from core.config import (
+    ALLOW_LIVE_TRADING,
     MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
     PAPER_TRADING,
     PROJECT_ROOT,
     TRADING_PAIRS,
     TRIGGER_TIMEFRAME,
+    classify_book,
     get_settings,
     migrate_circuit_breaker,
     migrate_position_book,
 )
+from core.order_lifecycle import live_orders_permitted
 from core.market_data import (
     add_macro_indicators,
     add_trigger_indicators,
@@ -90,12 +93,37 @@ def is_paper_trading() -> bool:
     return bool(PAPER_TRADING)
 
 
+def paper_starting_balance() -> float:
+    cfg = _cfg()
+    if cfg is not None:
+        try:
+            return float(cfg.paper_starting_balance)
+        except (TypeError, ValueError):
+            pass
+    return 10_000.0
+
+
+def allow_live_trading() -> bool:
+    """Second live gate. Default false. Does not override paper mode."""
+    cfg = _cfg()
+    if cfg is None:
+        return bool(ALLOW_LIVE_TRADING)
+    return bool(getattr(cfg, "allow_live_trading", ALLOW_LIVE_TRADING))
+
+
+def live_trading_active() -> bool:
+    """Real Kraken orders are armed only when both gates are open."""
+    return live_orders_permitted(is_paper_trading(), allow_live_trading())
+
+
 def desk_labels(*, paper: bool | None = None) -> dict[str, Any]:
-    """Header / equity-card copy for paper vs live Kraken mode."""
-    paper_mode = is_paper_trading() if paper is None else bool(paper)
+    """Header copy. Live is active only when both trading gates are open."""
+    paper_mode = (not live_trading_active()) if paper is None else bool(paper)
     if paper_mode:
         return {
             "paper_trading": True,
+            "active_mode": "paper",
+            "active_banner": "ACTIVE: PAPER TRADING",
             "desk_title": "Paper desk",
             "equity_label": "PAPER EQUITY",
             "live_badge": None,
@@ -103,6 +131,8 @@ def desk_labels(*, paper: bool | None = None) -> dict[str, Any]:
         }
     return {
         "paper_trading": False,
+        "active_mode": "live",
+        "active_banner": "ACTIVE: LIVE TRADING",
         "desk_title": "Live Execution Desk",
         "equity_label": "LIVE KRAKEN EQUITY",
         "live_badge": "● LIVE KRAKEN (USD)",
@@ -141,7 +171,7 @@ def check_token(request: Request, token: str | None) -> None:
 
 
 def _trade_log_name(*, paper: bool | None = None) -> str:
-    paper_mode = is_paper_trading() if paper is None else bool(paper)
+    paper_mode = (not live_trading_active()) if paper is None else bool(paper)
     return "paper_trades.csv" if paper_mode else "live_trades.csv"
 
 
@@ -226,6 +256,322 @@ def _resolve_start_equity(raw: dict[str, Any], equity_f: float | None, paper: bo
     return 10_000.0
 
 
+def _book_paths() -> dict[str, Path]:
+    paths = _paths()
+    state = paths["state"]
+    parent = state.parent
+    trades = paths.get("trades")
+    data_dir = trades.parent if isinstance(trades, Path) else parent
+    return {
+        "runner": state,
+        "paper": paths.get("paper_state") or (parent / "paper.json"),
+        "live": paths.get("live_state") or (parent / "live.json"),
+        "paper_trades": paths.get("paper_trades") or (data_dir / "paper_trades.csv"),
+        "live_trades": paths.get("live_trades") or (data_dir / "live_trades.csv"),
+        "rejects": paths.get("rejects") or (data_dir / "rejected_alerts.csv"),
+    }
+
+
+def _read_raw(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = json.loads(_read_shared(path))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("state unreadable %s: %s", path, exc)
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _book_metrics(raw: dict[str, Any] | None) -> dict[str, Any]:
+    pairs = _pairs()
+    if not isinstance(raw, dict):
+        return {
+            "exists": False,
+            "equity": None,
+            "starting_equity": None,
+            "pnl": None,
+            "pnl_pct": None,
+            "positions": [],
+            "open_count": 0,
+            "position": None,
+            "position_side": "FLAT",
+            "loss_streak": 0,
+            "breaker_active": False,
+            "breaker_bars": 0,
+            "last_bar": None,
+            "last_bars": {},
+            "max_open_positions": _max_open(),
+        }
+    try:
+        equity_f = float(raw["equity"]) if raw.get("equity") is not None else None
+    except (TypeError, ValueError):
+        equity_f = None
+    try:
+        starting = float(raw["start_equity"]) if raw.get("start_equity") is not None else None
+    except (TypeError, ValueError):
+        starting = None
+    if starting is None:
+        starting = _resolve_start_equity(raw, equity_f, True)
+    pnl = None if equity_f is None or starting is None else equity_f - starting
+    last_bars = dict(raw.get("last_bars") or {})
+    cards = _position_cards(migrate_position_book(raw, pairs), last_bars, pairs)
+    first_open = next((card["position"] for card in cards if card["position"] is not None), None)
+    side = "FLAT" if first_open is None else str(first_open.get("side") or first_open.get("status") or "FLAT").upper()
+    breaker = migrate_circuit_breaker(raw)
+    return {
+        "exists": True,
+        "equity": equity_f,
+        "starting_equity": starting,
+        "pnl": pnl,
+        "pnl_pct": None if pnl is None or not starting else (pnl / starting) * 100.0,
+        "positions": cards,
+        "open_count": sum(1 for card in cards if card["status"] != "FLAT"),
+        "position": first_open,
+        "position_side": side,
+        "loss_streak": int(breaker["loss_streak"]),
+        "breaker_active": bool(breaker["tripped"]),
+        "breaker_bars": int(breaker.get("cooldown_bars") or raw.get("breaker_bars") or 0),
+        "last_bar": raw.get("last_bar"),
+        "last_bars": last_bars,
+        "max_open_positions": _max_open(),
+    }
+
+
+def _select_books(baseline: float, *, active_live: bool) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Paper raw and live raw. A live deposit is never returned as the paper book."""
+    paths = _book_paths()
+    runner = _read_raw(paths["runner"])
+    paper_file = _read_raw(paths["paper"])
+    live_file = _read_raw(paths["live"])
+    runner_kind = classify_book(runner, baseline)
+
+    paper_raw = None
+    if not active_live and runner is not None and runner_kind != "live":
+        paper_raw = runner
+    elif paper_file is not None and classify_book(paper_file, baseline) != "live":
+        paper_raw = paper_file
+    elif runner is not None and runner_kind == "paper":
+        paper_raw = runner
+
+    live_raw = None
+    if runner is not None and runner_kind == "live":
+        live_raw = runner
+    elif live_file is not None and classify_book(live_file, baseline) != "paper":
+        live_raw = live_file
+    elif active_live and runner is not None and runner_kind != "paper":
+        live_raw = runner
+    return paper_raw, live_raw
+
+
+_BALANCE_TTL = 30.0
+_balance_cache: dict[str, Any] = {"at": 0.0, "payload": None}
+
+
+def peek_live_balance() -> dict[str, Any]:
+    """Read-only Kraken USD balance. Never places an order."""
+    now = time.monotonic()
+    cached = _balance_cache.get("payload")
+    if isinstance(cached, dict) and now - float(_balance_cache.get("at") or 0) < _BALANCE_TTL:
+        return cached
+    payload: dict[str, Any] = {"ok": False, "equity": None}
+    cfg = _cfg()
+    key = (getattr(cfg, "exchange_api_key", "") or "").strip() if cfg is not None else ""
+    secret = (getattr(cfg, "exchange_api_secret", "") or "").strip() if cfg is not None else ""
+    if cfg is not None and key and secret:
+        try:
+            from core.broker import fetch_quote_balance
+
+            payload = {
+                "ok": True,
+                "equity": float(fetch_quote_balance(cfg.exchange_id, key, secret)),
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.info("live balance unavailable: %s", type(exc).__name__)
+            payload = {"ok": False, "equity": None}
+    _balance_cache["at"] = now
+    _balance_cache["payload"] = payload
+    return payload
+
+
+def _paper_panel(raw: dict[str, Any] | None, *, in_use: bool, baseline: float) -> dict[str, Any]:
+    metrics = _book_metrics(raw)
+    if not metrics["exists"]:
+        metrics = _book_metrics(None)
+        metrics["positions"] = _position_cards({}, {}, _pairs())
+        metrics["equity"] = baseline
+        metrics["starting_equity"] = baseline
+        metrics["pnl"] = 0.0
+        metrics["pnl_pct"] = 0.0
+        note = f"Configured practice balance ${baseline:,.2f}. No paper fills yet."
+        balance_state = "configured"
+    else:
+        note = "Practice book · fake money"
+        balance_state = "book"
+    metrics.update(
+        {
+            "title": "PRACTICE / PAPER",
+            "money": "Fake money",
+            "in_use": in_use,
+            "use_label": "IN USE" if in_use else "NOT IN USE",
+            "idle": not in_use,
+            "equity_label": "PAPER EQUITY",
+            "balance_note": note,
+            "balance_state": balance_state,
+            "placeholder": None,
+            "status_line": (
+                ("Practice book is running. " if in_use else "Practice book is idle. ")
+                + (
+                    f"Circuit breaker ON · loss streak {metrics['loss_streak']}."
+                    if metrics.get("breaker_active")
+                    else f"Circuit breaker off · loss streak {metrics.get('loss_streak', 0)}."
+                )
+            ),
+        }
+    )
+    return metrics
+
+
+def _live_panel(
+    raw: dict[str, Any] | None,
+    *,
+    in_use: bool,
+    peeked: dict[str, Any] | None,
+) -> dict[str, Any]:
+    metrics = _book_metrics(raw)
+    peeked_equity = None
+    if isinstance(peeked, dict) and peeked.get("ok") and peeked.get("equity") is not None:
+        try:
+            peeked_equity = float(peeked["equity"])
+        except (TypeError, ValueError):
+            peeked_equity = None
+
+    if in_use and metrics["exists"]:
+        note = "Live Kraken equity. Real money."
+        balance_state = "book"
+        placeholder = None
+    elif in_use and peeked_equity is not None:
+        metrics["equity"] = peeked_equity
+        metrics["starting_equity"] = peeked_equity
+        metrics["pnl"] = 0.0
+        metrics["pnl_pct"] = 0.0
+        note = "Kraken free USD. Real money."
+        balance_state = "exchange"
+        placeholder = None
+    elif not in_use and peeked_equity is not None:
+        start = metrics["starting_equity"]
+        metrics["equity"] = peeked_equity
+        if start is not None:
+            metrics["pnl"] = peeked_equity - start
+            metrics["pnl_pct"] = None if not start else ((peeked_equity - start) / start) * 100.0
+        note = "Kraken free USD, read-only. Idle — no live orders."
+        balance_state = "exchange"
+        placeholder = None
+    elif metrics["exists"] and metrics["equity"] is not None:
+        note = "Last known Kraken USD. Idle — no live orders are firing."
+        balance_state = "last_known"
+        placeholder = None
+    else:
+        metrics = _book_metrics(None)
+        note = "Live not active"
+        balance_state = "unavailable"
+        placeholder = "Live not active"
+    if not in_use and balance_state == "unavailable":
+        metrics["positions"] = []
+    metrics.update(
+        {
+            "title": "LIVE / KRAKEN",
+            "money": "Real money",
+            "in_use": in_use,
+            "use_label": "IN USE" if in_use else "NOT IN USE",
+            "idle": not in_use,
+            "equity_label": "LIVE KRAKEN EQUITY",
+            "balance_note": note,
+            "balance_state": balance_state,
+            "placeholder": placeholder,
+            "status_line": (
+                "Real money is in use. " if in_use else "IDLE — live orders are not firing. "
+            )
+            + (
+                f"Circuit breaker ON · loss streak {metrics.get('loss_streak', 0)}."
+                if metrics.get("exists") and metrics.get("breaker_active")
+                else (
+                    f"Circuit breaker off · loss streak {metrics.get('loss_streak', 0)}."
+                    if metrics.get("exists")
+                    else ""
+                )
+            ),
+        }
+    )
+    return metrics
+
+
+def build_account_panels(*, peek_balance: bool = False) -> dict[str, Any]:
+    """Paper practice book and live Kraken book, side by side."""
+    baseline = paper_starting_balance()
+    armed = live_trading_active()
+    paper_flag = is_paper_trading()
+    paper_raw, live_raw = _select_books(baseline, active_live=armed)
+    peeked = peek_live_balance() if peek_balance and not armed else None
+    if armed:
+        banner = "ACTIVE: LIVE TRADING"
+        detail = (
+            "Real Kraken money is in use. The practice book is idle. "
+            "This dashboard does not place orders."
+        )
+    elif paper_flag:
+        banner = "ACTIVE: PAPER TRADING"
+        detail = (
+            f"Practice book is running from ${baseline:,.2f} fake money. "
+            "Live Kraken is idle — no live orders are firing."
+        )
+    else:
+        banner = "ACTIVE: PAPER TRADING"
+        detail = (
+            "Live orders are not armed. PAPER_TRADING is off and "
+            "ALLOW_LIVE_TRADING is off, so nothing is sent to Kraken."
+        )
+    return {
+        "active_mode": "live" if armed else "paper",
+        "active_banner": banner,
+        "active_detail": detail,
+        "paper_trading": not armed,
+        "allow_live_trading": allow_live_trading(),
+        "live_armed": armed,
+        "paper": _paper_panel(paper_raw, in_use=bool(paper_flag) and not armed, baseline=baseline),
+        "live": _live_panel(live_raw, in_use=armed, peeked=peeked),
+    }
+
+
+def _flatten_active(panels: dict[str, Any]) -> dict[str, Any]:
+    active = panels["live"] if panels["active_mode"] == "live" else panels["paper"]
+    labels = desk_labels(paper=panels["active_mode"] != "live")
+    return {
+        "exists": active.get("exists"),
+        "equity": active.get("equity"),
+        "starting_equity": active.get("starting_equity"),
+        "pnl": active.get("pnl"),
+        "pnl_pct": active.get("pnl_pct"),
+        "loss_streak": active.get("loss_streak", 0),
+        "breaker_active": active.get("breaker_active", False),
+        "breaker_bars": active.get("breaker_bars", 0),
+        "last_bar": active.get("last_bar"),
+        "last_bars": active.get("last_bars") or {},
+        "position_side": active.get("position_side", "FLAT"),
+        "position": active.get("position"),
+        "positions": active.get("positions") or [],
+        "open_count": active.get("open_count", 0),
+        "max_open_positions": active.get("max_open_positions", _max_open()),
+        **labels,
+        "active_mode": panels["active_mode"],
+        "active_banner": panels["active_banner"],
+        "active_detail": panels["active_detail"],
+        "live_armed": panels["live_armed"],
+        "paper": panels["paper"],
+        "live": panels["live"],
+    }
+
+
 def _empty_state(*, error: str | None = None) -> dict[str, Any]:
     pairs = _pairs()
     labels = desk_labels()
@@ -253,54 +599,8 @@ def _empty_state(*, error: str | None = None) -> dict[str, Any]:
 
 
 def read_runner_state() -> dict[str, Any]:
-    path = _paths()["state"]
-    labels = desk_labels()
-    if not path.exists():
-        return _empty_state()
-    try:
-        raw = json.loads(_read_shared(path))
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("state unreadable: %s", exc)
-        return _empty_state(error=str(exc))
-
-    equity = raw.get("equity")
-    try:
-        equity_f = float(equity) if equity is not None else None
-    except (TypeError, ValueError):
-        equity_f = None
-    starting = _resolve_start_equity(
-        raw if isinstance(raw, dict) else {},
-        equity_f,
-        labels["paper_trading"],
-    )
-    pnl = None if equity_f is None or starting is None else equity_f - starting
-
-    pairs = _pairs()
-    book = migrate_position_book(raw if isinstance(raw, dict) else {}, pairs)
-    last_bars = dict(raw.get("last_bars") or {})
-    cards = _position_cards(book, last_bars, pairs)
-    first_open = next((card["position"] for card in cards if card["position"] is not None), None)
-    side = "FLAT" if first_open is None else str(first_open.get("side") or first_open.get("status") or "FLAT").upper()
-    breaker = migrate_circuit_breaker(raw if isinstance(raw, dict) else {})
-
-    return {
-        "exists": True,
-        "equity": equity_f,
-        "starting_equity": starting,
-        "pnl": pnl,
-        "pnl_pct": None if pnl is None or not starting else (pnl / starting) * 100.0,
-        "loss_streak": int(breaker["loss_streak"]),
-        "breaker_active": bool(breaker["tripped"]),
-        "breaker_bars": int(breaker.get("cooldown_bars") or raw.get("breaker_bars") or 0),
-        "last_bar": raw.get("last_bar"),
-        "last_bars": last_bars,
-        "position_side": side,
-        "position": first_open,
-        "positions": cards,
-        "open_count": sum(1 for card in cards if card["status"] != "FLAT"),
-        "max_open_positions": _max_open(),
-        **labels,
-    }
+    """Active book, plus separate paper and live panels. No exchange orders."""
+    return _flatten_active(build_account_panels(peek_balance=False))
 
 
 def _f(value: Any) -> float | None:
@@ -365,8 +665,8 @@ def _enrich_trade(row: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def read_trades(limit: int = TRADE_LIMIT) -> dict[str, Any]:
-    path = _paths()["trades"]
+def read_trades(limit: int = TRADE_LIMIT, path: Path | None = None) -> dict[str, Any]:
+    path = path or _paths()["trades"]
     if not path.exists() or path.stat().st_size == 0:
         return {"count": 0, "trades": []}
     try:
@@ -501,15 +801,26 @@ def fetch_market() -> dict[str, Any]:
 
 
 def build_snapshot() -> dict[str, Any]:
-    state = read_runner_state()
+    panels = build_account_panels(peek_balance=True)
+    state = _flatten_active(panels)
     market = fetch_market()
-    trades = read_trades()
+    paths = _book_paths()
+    paper_trades = read_trades(path=paths["paper_trades"])
+    live_trades = read_trades(path=paths["live_trades"])
+    active_trades = live_trades if panels["active_mode"] == "live" else paper_trades
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "poll_seconds": 10,
+        "active_mode": panels["active_mode"],
+        "active_banner": panels["active_banner"],
+        "active_detail": panels["active_detail"],
+        "paper": panels["paper"],
+        "live": panels["live"],
         "state": state,
         "market": market,
-        "trades": trades,
+        "trades": active_trades,
+        "paper_trades": paper_trades,
+        "live_trades": live_trades,
         "rejects": read_reject_count(),
     }
 
@@ -540,14 +851,14 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body class="bg-ink text-slate-200 min-h-screen">
   <div class="max-w-6xl mx-auto px-5 py-6">
-    <header class="flex flex-wrap items-end justify-between gap-3 mb-6">
+    <header class="flex flex-wrap items-end justify-between gap-3 mb-4">
       <div>
         <p class="text-xs uppercase tracking-[0.2em] text-teal-400/80">Gemini Trend Guard</p>
         <div class="flex flex-wrap items-center gap-3 mt-1">
           <h1 id="desk-title" class="text-2xl font-semibold text-white">Paper desk</h1>
           <span id="live-badge" class="hidden inline-flex items-center gap-1.5 text-xs font-medium text-emerald-300 bg-emerald-500/10 ring-1 ring-emerald-500/30 px-2.5 py-1 rounded-md">● LIVE KRAKEN (USD)</span>
         </div>
-        <p class="text-sm text-slate-400">Read-only monitor · does not lock the runner</p>
+        <p class="text-sm text-slate-400">Read-only monitor · does not place orders · does not lock the runner</p>
       </div>
       <div class="text-right text-sm text-slate-400">
         <div>Updated <span id="updated" class="mono text-slate-200">—</span></div>
@@ -556,25 +867,45 @@ PAGE = r"""<!DOCTYPE html>
       </div>
     </header>
 
-    <section id="pair-cards" class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4"></section>
+    <section id="mode-banner" class="mb-4 rounded-xl border border-amber-300/50 bg-amber-400/10 px-4 py-3">
+      <p id="mode-banner-label" class="text-lg sm:text-xl font-semibold tracking-wide text-amber-100">ACTIVE: PAPER TRADING</p>
+      <p id="mode-detail" class="text-sm text-amber-50/80 mt-1">Practice book is running from $10,000.00 fake money. Live Kraken is idle — no live orders are firing.</p>
+    </section>
 
-    <section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
-      <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p id="equity-label" class="text-xs uppercase tracking-wider text-slate-400">PAPER EQUITY</p>
-        <p id="equity" class="text-3xl font-semibold mt-1 mono">—</p>
-        <p id="pnl" class="text-sm mt-2">—</p>
+    <section id="books" class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+      <article id="paper-panel" class="rounded-xl border border-amber-300/80 ring-2 ring-amber-400/40 bg-panel p-4">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.16em] text-amber-200/90">PRACTICE / PAPER</p>
+            <p class="text-sm text-slate-300">Fake money</p>
+          </div>
+          <span id="paper-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-amber-400/20 text-amber-100 ring-1 ring-amber-300/50">IN USE</span>
+        </div>
+        <p id="equity-label" class="text-xs uppercase tracking-wider text-slate-400 mt-4">PAPER EQUITY</p>
+        <p id="paper-equity" class="text-3xl font-semibold mt-1 mono text-white">$10,000.00</p>
+        <p id="paper-pnl" class="text-sm mt-2 text-slate-400">—</p>
+        <p id="paper-note" class="text-xs text-slate-400 mt-2">Configured practice balance. No paper fills yet.</p>
+        <p id="paper-status" class="text-sm mt-3 text-amber-100">Practice book is running.</p>
+        <div id="paper-positions" class="mt-3 space-y-2"></div>
       </article>
-      <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p class="text-xs uppercase tracking-wider text-slate-400">Active slots</p>
-        <p id="slots" class="text-3xl font-semibold mt-1 mono">—</p>
-        <p id="slots-detail" class="text-xs text-slate-400 mt-2">Waiting for book</p>
-      </article>
-      <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p class="text-xs uppercase tracking-wider text-slate-400">Circuit breaker</p>
-        <p id="breaker" class="text-3xl font-semibold mt-1">—</p>
-        <p id="breaker-detail" class="text-xs text-slate-400 mt-2">Loss streak —</p>
+      <article id="live-panel" class="rounded-xl border border-white/10 bg-panel p-4 opacity-60">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.16em] text-rose-200/80">LIVE / KRAKEN</p>
+            <p class="text-sm text-slate-400">Real money</p>
+          </div>
+          <span id="live-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-500/20 text-slate-300 ring-1 ring-white/10">NOT IN USE</span>
+        </div>
+        <p id="live-equity-label" class="text-xs uppercase tracking-wider text-slate-500 mt-4">LIVE KRAKEN EQUITY</p>
+        <p id="live-equity" class="text-3xl font-semibold mt-1 mono text-slate-300">Live not active</p>
+        <p id="live-pnl" class="text-sm mt-2 text-slate-500">—</p>
+        <p id="live-note" class="text-xs text-slate-500 mt-2">IDLE — live orders are not firing.</p>
+        <p id="live-status" class="text-sm mt-3 text-slate-400">IDLE — live orders are not firing.</p>
+        <div id="live-positions" class="mt-3 space-y-2"></div>
       </article>
     </section>
+
+    <section id="pair-cards" class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4"></section>
 
     <section class="bg-panel rounded-xl border border-white/5 p-4 mb-4 overflow-hidden">
       <div class="flex items-baseline justify-between mb-3">
@@ -602,7 +933,7 @@ PAGE = r"""<!DOCTYPE html>
 
     <section class="bg-panel rounded-xl border border-white/5 overflow-hidden">
       <div class="px-4 py-3 flex items-baseline justify-between border-b border-white/5">
-        <h2 class="text-sm uppercase tracking-wider text-slate-400">Trade log</h2>
+        <h2 id="trade-heading" class="text-sm uppercase tracking-wider text-slate-400">Active book trade log</h2>
         <p id="trade-meta" class="text-xs text-slate-500">—</p>
       </div>
       <div class="overflow-x-auto">
@@ -642,10 +973,83 @@ PAGE = r"""<!DOCTYPE html>
 
     const px = (n) => n == null || Number.isNaN(n) ? "—" : fmt(n, Number(n) >= 1000 ? 1 : Number(n) >= 100 ? 2 : 3);
 
+    const money = (n) => n == null || Number.isNaN(Number(n)) ? "—" : "$" + fmt(n, 2);
+
+    function positionBlock(panel, idleLive) {
+      const cards = panel.positions || [];
+      if (!cards.length) {
+        const msg = idleLive ? "No live positions. Nothing here is a fill." : "No open positions";
+        return `<p class="text-xs text-slate-500">${msg}</p>`;
+      }
+      return cards.map(card => {
+        const side = card.status || "FLAT";
+        const p = card.position;
+        const detail = p
+          ? `Entry ${px(p.entry_price)} · stop ${px(p.stop_loss || p.trail_stop || p.stop)} · target ${px(p.take_profit || p.target)}`
+          : "Flat";
+        return `<div class="flex items-baseline justify-between gap-2 text-sm border-t border-white/5 pt-2">
+          <span class="text-slate-300">${card.symbol || "—"}</span>
+          <span class="font-medium ${tonePos(side)}">${side}</span>
+          <span class="text-xs text-slate-500">${detail}</span>
+        </div>`;
+      }).join("");
+    }
+
+    function paintBook(prefix, panel, kind) {
+      const shell = document.getElementById(prefix + "-panel");
+      const inUse = !!panel.in_use;
+      shell.className = "rounded-xl border bg-panel p-4 " + (
+        inUse
+          ? (kind === "live"
+              ? "border-rose-400/80 ring-2 ring-rose-500/50"
+              : "border-amber-300/80 ring-2 ring-amber-400/40")
+          : "border-white/10 opacity-60"
+      );
+      const useEl = document.getElementById(prefix + "-use");
+      useEl.textContent = panel.use_label || (inUse ? "IN USE" : "NOT IN USE");
+      useEl.className = "inline-flex px-2.5 py-1 rounded-md text-xs font-semibold ring-1 " + (
+        inUse
+          ? (kind === "live"
+              ? "bg-rose-500/20 text-rose-100 ring-rose-400/60"
+              : "bg-amber-400/20 text-amber-100 ring-amber-300/50")
+          : "bg-slate-500/20 text-slate-300 ring-white/10"
+      );
+      const equityEl = document.getElementById(prefix === "paper" ? "paper-equity" : "live-equity");
+      if (panel.placeholder && panel.equity == null) equityEl.textContent = panel.placeholder;
+      else equityEl.textContent = money(panel.equity);
+      const pnlEl = document.getElementById(prefix + "-pnl");
+      if (panel.pnl == null) {
+        pnlEl.textContent = panel.placeholder ? "" : "P&L unavailable";
+        pnlEl.className = "text-sm mt-2 text-slate-500";
+      } else {
+        const sign = panel.pnl >= 0 ? "+" : "";
+        pnlEl.textContent = `${sign}${money(panel.pnl)}  (${sign}${fmt(panel.pnl_pct, 2)}%) vs ${money(panel.starting_equity)} start`;
+        pnlEl.className = "text-sm mt-2 " + (panel.pnl >= 0 ? "text-teal-300" : "text-rose-300");
+      }
+      document.getElementById(prefix + "-note").textContent = panel.balance_note || "";
+      document.getElementById(prefix + "-status").textContent = panel.status_line || "";
+      document.getElementById(prefix + "-positions").innerHTML = positionBlock(panel, kind === "live" && !inUse);
+    }
+
     function render(data) {
       const s = data.state || {};
+      const paper = data.paper || s.paper || {};
+      const live = data.live || s.live || {};
       const m = data.market || {};
-      const cards = s.positions || [];
+      const banner = data.active_banner || s.active_banner || (s.paper_trading === false ? "ACTIVE: LIVE TRADING" : "ACTIVE: PAPER TRADING");
+      const liveActive = banner.indexOf("LIVE TRADING") !== -1 && banner.indexOf("PAPER") === -1;
+      const bannerEl = document.getElementById("mode-banner");
+      document.getElementById("mode-banner-label").textContent = banner;
+      document.getElementById("mode-detail").textContent = data.active_detail || s.active_detail || "";
+      bannerEl.className = "mb-4 rounded-xl border px-4 py-3 " + (
+        liveActive
+          ? "border-rose-400/70 bg-rose-500/15"
+          : "border-amber-300/50 bg-amber-400/10"
+      );
+      document.getElementById("mode-banner-label").className = "text-lg sm:text-xl font-semibold tracking-wide " + (liveActive ? "text-rose-100" : "text-amber-100");
+      if (paper.title) paintBook("paper", paper, "paper");
+      if (live.title) paintBook("live", live, "live");
+      const cards = (liveActive ? live.positions : paper.positions) || s.positions || [];
       const marketBySymbol = Object.fromEntries((m.pairs || []).map(row => [row.symbol, row]));
       const toneRegime = (reg) => ({BULL:"green", BEAR:"red", CHOP:"amber", NEUTRAL:"amber"}[reg] || "slate");
       document.getElementById("pair-cards").innerHTML = cards.map(card => {
@@ -666,38 +1070,15 @@ PAGE = r"""<!DOCTYPE html>
         </article>`;
       }).join("") || `<article class="bg-panel rounded-xl border border-white/5 p-4 md:col-span-3"><p class="text-sm text-slate-500">No position book</p></article>`;
 
-      document.getElementById("desk-title").textContent = s.desk_title || (s.paper_trading === false ? "Live Execution Desk" : "Paper desk");
+      document.getElementById("desk-title").textContent = liveActive ? "Live Execution Desk" : "Paper desk";
       const badgeEl = document.getElementById("live-badge");
-      if (s.live_badge) {
-        badgeEl.textContent = s.live_badge;
+      if (liveActive) {
+        badgeEl.textContent = "● LIVE KRAKEN (USD)";
         badgeEl.classList.remove("hidden");
       } else {
         badgeEl.classList.add("hidden");
       }
-      document.getElementById("equity-label").textContent = s.equity_label || (s.paper_trading === false ? "LIVE KRAKEN EQUITY" : "PAPER EQUITY");
-
-      document.getElementById("equity").textContent = s.equity == null ? "—" : fmt(s.equity, 2);
-      const pnl = s.pnl;
-      const pnlEl = document.getElementById("pnl");
-      if (pnl == null) { pnlEl.textContent = "Starting balance unknown"; pnlEl.className = "text-sm mt-2 text-slate-400"; }
-      else {
-        const sign = pnl >= 0 ? "+" : "";
-        pnlEl.textContent = `${sign}${fmt(pnl, 2)}  (${sign}${fmt(s.pnl_pct, 2)}%) vs ${fmt(s.starting_equity, 2)} start`;
-        pnlEl.className = "text-sm mt-2 " + (pnl >= 0 ? "text-teal-300" : "text-rose-300");
-      }
-
-      const openCount = s.open_count || 0;
-      const maxOpen = s.max_open_positions || 0;
-      document.getElementById("slots").textContent = maxOpen ? `${openCount} / ${maxOpen}` : String(openCount);
-      document.getElementById("slots-detail").textContent = `Active Slots: ${openCount} / ${maxOpen || 2}` + (
-        openCount
-          ? " · " + cards.filter(c => c.status && c.status !== "FLAT").map(c => `${c.symbol} ${c.status}`).join(" · ")
-          : " · all pairs flat"
-      );
-
-      document.getElementById("breaker").textContent = s.breaker_active ? "ON" : "off";
-      document.getElementById("breaker").className = "text-3xl font-semibold mt-1 " + (s.breaker_active ? "text-rose-300" : "text-teal-300");
-      document.getElementById("breaker-detail").textContent = `Loss streak ${s.loss_streak || 0}` + (s.breaker_active ? ` · cooldown ${s.breaker_bars || 0} bars` : "");
+      document.getElementById("trade-heading").textContent = liveActive ? "Live trade log · real fills only" : "Paper trade log · fake money";
 
       const pairRows = m.pairs || [];
       document.getElementById("mkt-meta").textContent = [m.exchange, m.timeframe, m.as_of || ""].filter(Boolean).join(" · ");
@@ -758,7 +1139,7 @@ PAGE = r"""<!DOCTYPE html>
         if (res.status === 401) throw new Error("add ?token= from DASHBOARD_SECRET or WEBHOOK_SECRET");
         if (!res.ok) throw new Error("HTTP " + res.status);
         render(await res.json());
-        document.getElementById("status").textContent = "live";
+        document.getElementById("status").textContent = "connected";
         document.getElementById("status").className = "text-xs mt-1 text-teal-400";
       } catch (e) {
         document.getElementById("status").textContent = "poll failed: " + e.message;

@@ -30,6 +30,19 @@ def test_page_has_multi_pair_surfaces() -> None:
     assert "LIVE KRAKEN EQUITY" in PAGE
     assert "PAPER EQUITY" in PAGE
     assert "● LIVE KRAKEN (USD)" in PAGE
+    assert "ACTIVE: PAPER TRADING" in PAGE
+    assert "ACTIVE: LIVE TRADING" in PAGE
+    assert "PRACTICE / PAPER" in PAGE
+    assert "LIVE / KRAKEN" in PAGE
+    assert "Fake money" in PAGE
+    assert "Real money" in PAGE
+    assert "NOT IN USE" in PAGE
+    assert "IN USE" in PAGE
+    assert "Live not active" in PAGE
+    assert 'id="mode-banner"' in PAGE
+    assert 'id="paper-panel"' in PAGE
+    assert 'id="live-panel"' in PAGE
+    assert "lg:grid-cols-2" in PAGE
     assert ">Symbol</th>" in PAGE
     assert ">1h Regime</th>" in PAGE
     assert ">EMA 9</th>" in PAGE
@@ -45,10 +58,14 @@ def test_desk_labels_toggle() -> None:
     assert paper["desk_title"] == "Paper desk"
     assert paper["equity_label"] == "PAPER EQUITY"
     assert paper["live_badge"] is None
+    assert paper["active_banner"] == "ACTIVE: PAPER TRADING"
+    assert paper["active_mode"] == "paper"
     live = desk_labels(paper=False)
     assert live["desk_title"] == "Live Execution Desk"
     assert live["equity_label"] == "LIVE KRAKEN EQUITY"
     assert live["live_badge"] == "● LIVE KRAKEN (USD)"
+    assert live["active_banner"] == "ACTIVE: LIVE TRADING"
+    assert live["active_mode"] == "live"
     print("    paper/live desk labels")
 
 
@@ -74,8 +91,9 @@ def test_read_positions_book() -> None:
     state_path.write_text(
         json.dumps(
             {
-                "equity": 500.0,
-                "start_equity": 500.0,
+                "equity": 10000.0,
+                "start_equity": 10000.0,
+                "book": "paper",
                 "circuit_breaker": {"loss_streak": 0, "tripped": False, "cooldown_bars": 0},
                 "last_bar": "2026-09-11T16:00:00+00:00",
                 "last_bars": {
@@ -118,9 +136,16 @@ def test_read_positions_book() -> None:
     assert state["open_count"] == 2
     assert state["max_open_positions"] == 2
     assert state["position"]["entry_price"] == 77000
-    assert state["starting_equity"] == 500.0
+    assert state["starting_equity"] == 10000.0
     assert abs(state["pnl"] or 0) < 1e-9
     assert abs(state["pnl_pct"] or 0) < 1e-9
+    assert state["active_banner"] == "ACTIVE: PAPER TRADING"
+    assert state["paper"]["in_use"] is True
+    assert state["paper"]["use_label"] == "IN USE"
+    assert state["paper"]["title"] == "PRACTICE / PAPER"
+    assert state["live"]["in_use"] is False
+    assert state["live"]["use_label"] == "NOT IN USE"
+    assert state["live"]["placeholder"] == "Live not active"
     print("    book cards BTC LONG / ETH FLAT / SOL SHORT")
 
 
@@ -146,21 +171,117 @@ def test_live_start_equity_return_math() -> None:
 
     original_paths = dash._paths
     original_paper = dash.is_paper_trading
+    original_allow = dash.allow_live_trading
     dash._paths = lambda: {"state": state_path, "trades": tmp / "live_trades.csv", "rejects": tmp / "r.csv"}
     dash.is_paper_trading = lambda: False
+    dash.allow_live_trading = lambda: True
     try:
         state = read_runner_state()
     finally:
         dash._paths = original_paths
         dash.is_paper_trading = original_paper
+        dash.allow_live_trading = original_allow
 
     assert state["desk_title"] == "Live Execution Desk"
     assert state["equity_label"] == "LIVE KRAKEN EQUITY"
     assert state["live_badge"] == "● LIVE KRAKEN (USD)"
+    assert state["active_banner"] == "ACTIVE: LIVE TRADING"
     assert state["starting_equity"] == 500.0
     assert state["pnl"] == 0.0
     assert state["pnl_pct"] == 0.0
+    assert state["live"]["in_use"] is True
+    assert state["live"]["use_label"] == "IN USE"
+    assert state["live"]["title"] == "LIVE / KRAKEN"
+    assert state["paper"]["in_use"] is False
+    assert state["paper"]["use_label"] == "NOT IN USE"
+    assert state["paper"]["equity"] == 10000.0
+    assert state["paper"]["title"] == "PRACTICE / PAPER"
     print("    live equity +0.00 vs 500 start")
+
+
+def test_idle_live_book_is_not_the_paper_account() -> None:
+    """A ~$500 Kraken baseline must not be labeled as the $10k practice book."""
+    tmp = Path(tempfile.mkdtemp(prefix="gemini-dash-"))
+    state_path = tmp / "runner.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "equity": 500.0,
+                "start_equity": 500.0,
+                "book": "live",
+                "circuit_breaker": {"loss_streak": 1, "tripped": False, "cooldown_bars": 0},
+                "positions": {
+                    "BTC/USD": {"status": "LONG", "side": "LONG", "entry_price": 77000, "qty": 0.01},
+                    "ETH/USD": {"status": "FLAT"},
+                    "SOL/USD": {"status": "FLAT"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    import core.dashboard as dash
+
+    original_paths = dash._paths
+    original_paper = dash.is_paper_trading
+    original_allow = dash.allow_live_trading
+    dash._paths = lambda: {"state": state_path, "trades": tmp / "paper_trades.csv", "rejects": tmp / "r.csv"}
+    dash.is_paper_trading = lambda: True
+    dash.allow_live_trading = lambda: False
+    try:
+        state = read_runner_state()
+    finally:
+        dash._paths = original_paths
+        dash.is_paper_trading = original_paper
+        dash.allow_live_trading = original_allow
+
+    assert state["active_banner"] == "ACTIVE: PAPER TRADING"
+    assert state["active_mode"] == "paper"
+    assert state["paper"]["in_use"] is True
+    assert state["paper"]["money"] == "Fake money"
+    assert state["paper"]["equity"] == 10000.0
+    assert state["paper"]["starting_equity"] == 10000.0
+    assert all(card["status"] == "FLAT" for card in state["paper"]["positions"])
+    assert state["live"]["in_use"] is False
+    assert state["live"]["use_label"] == "NOT IN USE"
+    assert state["live"]["idle"] is True
+    assert state["live"]["money"] == "Real money"
+    assert state["live"]["equity"] == 500.0
+    assert state["live"]["balance_state"] == "last_known"
+    assert "IDLE" in state["live"]["status_line"]
+    live_btc = next(card for card in state["live"]["positions"] if card["symbol"] == "BTC/USD")
+    assert live_btc["status"] == "LONG"
+    assert state["equity"] == 10000.0
+    print("    $10k paper in use, $500 Kraken idle")
+
+
+def test_closed_live_gate_does_not_mark_kraken_in_use() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="gemini-dash-"))
+    state_path = tmp / "runner.json"
+    state_path.write_text(
+        json.dumps({"equity": 500.0, "start_equity": 500.0, "positions": {}}),
+        encoding="utf-8",
+    )
+    import core.dashboard as dash
+
+    original_paths = dash._paths
+    original_paper = dash.is_paper_trading
+    original_allow = dash.allow_live_trading
+    dash._paths = lambda: {"state": state_path, "trades": tmp / "t.csv", "rejects": tmp / "r.csv"}
+    dash.is_paper_trading = lambda: False
+    dash.allow_live_trading = lambda: False
+    try:
+        state = read_runner_state()
+    finally:
+        dash._paths = original_paths
+        dash.is_paper_trading = original_paper
+        dash.allow_live_trading = original_allow
+
+    assert state["active_banner"] == "ACTIVE: PAPER TRADING"
+    assert state["live_armed"] is False
+    assert state["live"]["in_use"] is False
+    assert state["live"]["use_label"] == "NOT IN USE"
+    assert state["paper"]["in_use"] is False
+    print("    live gate closed keeps Kraken idle")
 
 
 def test_dashboard_bind_requires_secret_off_localhost() -> None:
@@ -241,6 +362,8 @@ def main() -> int:
         ("trade symbol", test_enrich_trade_keeps_symbol),
         ("position book", test_read_positions_book),
         ("live return math", test_live_start_equity_return_math),
+        ("paper vs idle live", test_idle_live_book_is_not_the_paper_account),
+        ("closed live gate", test_closed_live_gate_does_not_mark_kraken_in_use),
         ("bind requires secret", test_dashboard_bind_requires_secret_off_localhost),
     ]
     failures = 0
