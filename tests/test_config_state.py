@@ -20,6 +20,7 @@ from core.config import (
     MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
     POLL_INTERVAL_SECONDS,
+    ALLOW_LIVE_TRADING,
     POSITION_SIZE_FRACTION,
     PAPER_TRADING,
     SPOT_LONG_ONLY,
@@ -48,11 +49,12 @@ def test_mtf_defaults() -> None:
     assert TRIGGER_EMA_FAST == 9
     assert TRIGGER_EMA_SLOW == 21
     assert MAX_OPEN_POSITIONS == 2
-    assert POSITION_SIZE_FRACTION == 0.48
+    assert POSITION_SIZE_FRACTION == 0.25
     assert ATR_STOP_MULTIPLIER == 1.5
     assert ATR_PROFIT_MULTIPLIER == 3.5
     assert SPOT_LONG_ONLY is True
     assert PAPER_TRADING is True
+    assert ALLOW_LIVE_TRADING is False
     assert USE_POST_ONLY is True
     print("    MTF constants")
 

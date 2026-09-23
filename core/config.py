@@ -64,9 +64,10 @@ TRIGGER_ATR_PERIOD = 14
 #: Hard cap on concurrent paper positions across the whole book.
 MAX_OPEN_POSITIONS = 2
 
-#: Fraction of current equity allocated to each new fill. 0.48 leaves room
-#: for fees on a $100–$200 account while still using two slots.
-POSITION_SIZE_FRACTION = 0.48
+#: Fraction of current equity allocated to each new fill. With
+#: MAX_OPEN_POSITIONS = 2, 0.25 uses about half of equity and leaves the
+#: rest as a cash buffer for fees and slippage.
+POSITION_SIZE_FRACTION = 0.25
 
 #: 15m ATR multiples. 1.5 / 3.5 is about 1 : 2.33 risk-to-reward.
 ATR_STOP_MULTIPLIER = 1.5
@@ -75,8 +76,13 @@ ATR_PROFIT_MULTIPLIER = 3.5
 #: Spot accounts cannot sell short. The runner skips SELL entries when True.
 SPOT_LONG_ONLY = True
 
-#: Stay on the paper book until the live deposit is confirmed.
+#: Practice mode is the default. Copying `.env.example` stays on the paper book.
 PAPER_TRADING = True
+
+#: Second gate for real orders. Ignored while paper mode is on. Live orders
+#: are sent only when PAPER_TRADING is false AND this flag is true. Paper off
+#: without this flag fails closed and places nothing.
+ALLOW_LIVE_TRADING = False
 
 #: Live entries are post-only limits at the 15m close (maker), not market takes.
 USE_POST_ONLY = True
@@ -108,6 +114,7 @@ class Settings:
     atr_profit_multiplier: float = ATR_PROFIT_MULTIPLIER
     spot_long_only: bool = SPOT_LONG_ONLY
     paper_trading: bool = PAPER_TRADING
+    allow_live_trading: bool = ALLOW_LIVE_TRADING
     use_post_only: bool = USE_POST_ONLY
     exchange_api_key: str = ""
     exchange_api_secret: str = ""
@@ -267,6 +274,7 @@ def dump_runner_state(
     breaker_bars: int = 0,
     start_equity: float | None = None,
     pairs: tuple[str, ...] | None = None,
+    pending_orders: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """Serialize runner state in the MTF schema.
 
@@ -292,6 +300,12 @@ def dump_runner_state(
         payload["last_bar"] = last_bar
     if last_bars is not None:
         payload["last_bars"] = dict(last_bars)
+    if pending_orders is not None:
+        payload["pending_orders"] = {
+            symbol: dict(record)
+            for symbol, record in pending_orders.items()
+            if isinstance(record, dict)
+        }
     return payload
 
 
@@ -359,6 +373,7 @@ def get_settings() -> Settings:
         ),
         spot_long_only=_env_bool("SPOT_LONG_ONLY", SPOT_LONG_ONLY),
         paper_trading=_env_bool("PAPER_TRADING", PAPER_TRADING),
+        allow_live_trading=_env_bool("ALLOW_LIVE_TRADING", ALLOW_LIVE_TRADING),
         use_post_only=_env_bool("USE_POST_ONLY", USE_POST_ONLY),
         exchange_api_key=(os.getenv("EXCHANGE_API_KEY") or "").strip(),
         exchange_api_secret=(os.getenv("EXCHANGE_API_SECRET") or "").strip(),

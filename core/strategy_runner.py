@@ -1,4 +1,8 @@
-"""Native paper-trading loop: 1h macro + 15m trigger -> Gemini -> CSV.
+"""Native trading loop: 1h macro + 15m trigger -> Gemini -> CSV.
+
+Practice mode is the default. Live Kraken orders are sent only when paper
+mode is off and ALLOW_LIVE_TRADING is true. Post-only limit entries stay
+pending until the exchange reports a fill.
 
 Each cycle fetches 1h candles for the trend filter and 15m candles for the
 pullback entry. Longs only fire when the 1h regime is BULL and 15m EMA 9
@@ -29,6 +33,7 @@ if __package__ in (None, ""):
 from core.broker import (
     PairLimits,
     default_pair_limits,
+    fetch_order,
     fetch_quote_balance,
     load_pair_limits,
     place_limit_entry,
@@ -37,6 +42,7 @@ from core.broker import (
     truncate_price,
 )
 from core.config import (
+    ALLOW_LIVE_TRADING,
     ATR_PROFIT_MULTIPLIER,
     ATR_STOP_MULTIPLIER,
     MACRO_ADX_THRESHOLD,
@@ -59,6 +65,14 @@ from core.config import (
     migrate_position_book,
 )
 from core.gemini_agent import Decision, GeminiAgent
+from core.order_lifecycle import (
+    assert_live_trading_allowed,
+    build_pending_entry,
+    classify_order,
+    fill_price,
+    filled_qty,
+    order_id_of,
+)
 from core.market_data import (
     add_macro_indicators,
     add_trigger_indicators,
@@ -150,6 +164,8 @@ class RunnerState:
     last_bars: dict[str, str] = field(default_factory=dict)
     #: Legacy single-slot mirror. None means the book is flat.
     position: dict[str, Any] | None = None
+    #: Resting live entry orders keyed by symbol. Not open positions.
+    pending_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -179,6 +195,8 @@ class CycleReport:
     legs: list["CycleReport"] = field(default_factory=list)
     book: dict[str, str] = field(default_factory=dict)
     macro_regime: str = "NEUTRAL"
+    #: symbol -> resting live order id, while the local slot is still flat.
+    pending: dict[str, str] = field(default_factory=dict)
 
 
 def timeframe_delta(timeframe: str) -> pd.Timedelta:
@@ -534,14 +552,24 @@ def open_altcoins(positions: dict[str, dict[str, Any]]) -> list[str]:
     return open_alts
 
 
-def correlation_block_reason(symbol: str, positions: dict[str, dict[str, Any]]) -> str | None:
-    """Block a second altcoin when one alt slot is already filled.
+def correlation_block_reason(
+    symbol: str,
+    positions: dict[str, dict[str, Any]],
+    pending: dict[str, Any] | None = None,
+) -> str | None:
+    """Block a second altcoin when one alt slot is already filled or pending.
 
     Book shape is at most 1 BTC + 1 alt (ETH or SOL), never ETH+SOL together.
+    A resting live order counts as a filled slot so two alts cannot both rest.
     """
     if not is_altcoin(symbol):
         return None
     open_alts = open_altcoins(positions)
+    for other, record in (pending or {}).items():
+        if not isinstance(record, dict):
+            continue
+        if is_altcoin(other) and other not in open_alts:
+            open_alts.append(other)
     if any(other != symbol for other in open_alts):
         return "alt_correlation_cap"
     return None
@@ -607,10 +635,12 @@ class StrategyRunner:
         pairs: tuple[str, ...] | None = None,
         fetch_delay: float | None = None,
         paper_trading: bool | None = None,
+        allow_live_trading: bool | None = None,
         use_post_only: bool | None = None,
         pair_limits: dict[str, PairLimits] | None = None,
         balance_fn: Callable[[], float] | None = None,
         order_fn: Callable[..., Any] | None = None,
+        fetch_order_fn: Callable[..., Any] | None = None,
     ) -> None:
         self._settings = None
         self.fetch_fn = fetch_fn or fetch_ohlcv
@@ -632,6 +662,9 @@ class StrategyRunner:
             self.atr_profit_mult = ATR_PROFIT_MULTIPLIER
             self.adx_threshold = MACRO_ADX_THRESHOLD
             self.paper_trading = PAPER_TRADING if paper_trading is None else bool(paper_trading)
+            self.allow_live_trading = (
+                ALLOW_LIVE_TRADING if allow_live_trading is None else bool(allow_live_trading)
+            )
             self.use_post_only = USE_POST_ONLY if use_post_only is None else bool(use_post_only)
         else:
             self.pairs = tuple(self.settings.trading_pairs or TRADING_PAIRS)
@@ -648,6 +681,11 @@ class StrategyRunner:
             self.paper_trading = (
                 bool(self.settings.paper_trading) if paper_trading is None else bool(paper_trading)
             )
+            self.allow_live_trading = (
+                bool(self.settings.allow_live_trading)
+                if allow_live_trading is None
+                else bool(allow_live_trading)
+            )
             self.use_post_only = (
                 bool(self.settings.use_post_only) if use_post_only is None else bool(use_post_only)
             )
@@ -662,6 +700,8 @@ class StrategyRunner:
             if starting_equity is not None
             else self.settings.paper_starting_balance
         )
+        # Captured before a live sync replaces start_equity with the exchange balance.
+        self._paper_baseline = float(self.starting_equity)
         data_dir = self.settings.paths["data"] if trade_log is None else trade_log.parent
         default_log = "paper_trades.csv" if self.paper_trading else "live_trades.csv"
         self.trade_log = trade_log or (data_dir / default_log)
@@ -669,8 +709,16 @@ class StrategyRunner:
         self.state_path = state_path or (self.settings.paths["root"] / "state" / "runner.json")
         self.balance_fn = balance_fn
         self.order_fn = order_fn
+        self.fetch_order_fn = fetch_order_fn
+        self._resolved_entries: dict[str, str] = {}
         self.pair_limits = pair_limits if pair_limits is not None else self._load_pair_limits(pairs is None)
         self.state = self._load_state()
+        if not self.paper_trading:
+            # Fail before any private balance or order call when the live gate is shut.
+            assert_live_trading_allowed(self.paper_trading, self.allow_live_trading)
+            log.warning(
+                "LIVE TRADING is on (PAPER_TRADING=false and ALLOW_LIVE_TRADING=true)"
+            )
         if self.paper_trading:
             if self.state.start_equity is None:
                 self.state.start_equity = float(self.starting_equity)
@@ -700,7 +748,9 @@ class StrategyRunner:
 
     def get_agent(self) -> GeminiAgent:
         if self._agent is None:
-            self._agent = GeminiAgent()
+            self._agent = GeminiAgent(paper_trading=self.paper_trading)
+        elif isinstance(self._agent, GeminiAgent):
+            self._agent.paper_trading = self.paper_trading
         return self._agent
 
     def _load_pair_limits(self, allow_network: bool) -> dict[str, PairLimits]:
@@ -732,7 +782,7 @@ class StrategyRunner:
                 self.settings.exchange_api_secret,
             )
         prior = self.state.equity
-        paper_baseline = float(self.settings.paper_starting_balance)
+        paper_baseline = float(self._paper_baseline)
         prior_start = self.state.start_equity
         migrating_from_paper = (
             prior_start is not None
@@ -755,12 +805,28 @@ class StrategyRunner:
             log.warning("live USD/ZUSD free balance is 0; new entries will be skipped")
         return live
 
-    def _submit_live_entry(self, symbol: str, qty: float, price: float) -> float | None:
+    def _committed_slots(self) -> int:
+        """Open positions plus resting entry orders. Both consume a slot."""
+        return count_open_positions(self.state.positions) + len(self.state.pending_orders)
+
+    @staticmethod
+    def _pending_from_state(raw: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return {}
+        pending: dict[str, dict[str, Any]] = {}
+        for symbol, record in raw.items():
+            if isinstance(record, dict) and record.get("order_id"):
+                pending[str(symbol)] = dict(record)
+        return pending
+
+    def _submit_live_entry(self, symbol: str, qty: float, price: float) -> dict[str, Any] | None:
+        """Place a post-only limit. The return value is the exchange ack, not a fill."""
+        assert_live_trading_allowed(self.paper_trading, self.allow_live_trading)
         limits = self.pair_limit(symbol)
         limit_price = truncate_price(price, limits.pair_decimals)
         try:
             if self.order_fn is not None:
-                self.order_fn(
+                result = self.order_fn(
                     "limit",
                     "buy",
                     symbol,
@@ -769,7 +835,7 @@ class StrategyRunner:
                     {"postOnly": True} if self.use_post_only else {},
                 )
             else:
-                place_limit_entry(
+                result = place_limit_entry(
                     self.exchange_id,
                     self.settings.exchange_api_key,
                     self.settings.exchange_api_secret,
@@ -781,9 +847,16 @@ class StrategyRunner:
         except Exception as exc:  # noqa: BLE001
             log.error("live entry rejected for %s: %s", symbol, exc)
             return None
-        return qty
+        if not isinstance(result, dict):
+            log.error(
+                "live entry for %s returned no order payload; not marking a position open",
+                symbol,
+            )
+            return None
+        return result
 
     def _submit_live_exit(self, symbol: str, qty: float) -> bool:
+        assert_live_trading_allowed(self.paper_trading, self.allow_live_trading)
         try:
             if self.order_fn is not None:
                 self.order_fn("market", "sell", symbol, qty, None, {})
@@ -799,6 +872,135 @@ class StrategyRunner:
             log.error("live exit rejected for %s: %s", symbol, exc)
             return False
         return True
+
+    def _fetch_live_order(self, symbol: str, order_id: str) -> dict[str, Any] | None:
+        try:
+            if self.fetch_order_fn is not None:
+                result = self.fetch_order_fn(symbol, order_id)
+            else:
+                result = fetch_order(
+                    self.exchange_id,
+                    self.settings.exchange_api_key,
+                    self.settings.exchange_api_secret,
+                    order_id,
+                    symbol,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.error("could not fetch live order %s for %s: %s", order_id, symbol, exc)
+            return None
+        if not isinstance(result, dict):
+            return None
+        return result
+
+    def _entry_signal_at(self, signal: Signal, price: float) -> Signal:
+        if price <= 0 or abs(price - signal.price) <= 1e-12:
+            return signal
+        return Signal(
+            action=signal.action,
+            reason=signal.reason,
+            price=price,
+            atr=signal.atr,
+            stop=signal.stop,
+            target=signal.target,
+            adx=signal.adx,
+            macro_ema=signal.macro_ema,
+        )
+
+    def _log_entry(self, symbol: str, signal: Signal, decision: Decision, position: Position) -> str:
+        extra = {
+            "verdict": "CONFIRMED",
+            "confidence": round(decision.confidence, 4),
+            "agent_action": decision.action,
+            "model": position.model,
+            "rationale": decision.rationale,
+            "alert_reason": signal.reason,
+            "adx": signal.adx,
+            "macro_ema": signal.macro_ema,
+            "stop_loss": position.stop,
+            "take_profit": position.target,
+        }
+        append_row(
+            self.trade_log,
+            self._base_row(signal.action, signal.price, signal, extra, symbol=symbol),
+        )
+        return str(self.trade_log)
+
+    def _apply_stored_model(self, model: str | None) -> None:
+        if not model or self._agent is None:
+            return
+        if not getattr(self._agent, "last_model_used", None):
+            self._agent.last_model_used = model
+
+    def _materialize_pending(self, symbol: str, record: dict[str, Any], order: dict[str, Any]) -> str | None:
+        """Open the local slot once a resting entry is actually filled."""
+        qty = filled_qty(order, float(record.get("qty") or 0.0))
+        if qty <= 0:
+            log.error("filled order for %s reported no size; leaving the slot flat", symbol)
+            return None
+        price = fill_price(order, float(record.get("price") or 0.0))
+        signal = Signal(
+            action=record.get("action") or "BUY",  # type: ignore[arg-type]
+            reason=str(record.get("reason") or ""),
+            price=price,
+            atr=float(record.get("atr") or 0.0),
+            stop=float(record.get("stop") or 0.0),
+            target=float(record.get("target") or 0.0),
+            adx=float(record.get("adx") or 0.0),
+            macro_ema=float(record.get("macro_ema") or 0.0),
+        )
+        decision = Decision(
+            action=str(signal.action),
+            confidence=float(record.get("confidence") or 0.0),
+            rationale=str(record.get("rationale") or ""),
+            stop_loss=signal.stop,
+            take_profit=signal.target,
+        )
+        self._apply_stored_model(record.get("model"))
+        position = self._open_position(
+            symbol,
+            signal,
+            decision,
+            str(record.get("opened_bar") or ""),
+            str(record.get("macro_regime") or "UNKNOWN"),
+            qty,
+        )
+        if record.get("model"):
+            position.model = record.get("model")
+            slot = self.state.positions.get(symbol)
+            if isinstance(slot, dict):
+                slot["model"] = record.get("model")
+        return self._log_entry(symbol, signal, decision, position)
+
+    def _reconcile_pending_entries(self) -> None:
+        """Promote resting limits that filled, and drop cancels or expiries."""
+        if self.paper_trading or not self.state.pending_orders:
+            return
+        for symbol, record in list(self.state.pending_orders.items()):
+            order_id = str(record.get("order_id") or "")
+            if not order_id:
+                self.state.pending_orders.pop(symbol, None)
+                continue
+            order = self._fetch_live_order(symbol, order_id)
+            if order is None:
+                log.warning(
+                    "pending entry %s for %s could not be fetched; leaving it pending",
+                    order_id,
+                    symbol,
+                )
+                continue
+            kind = classify_order(order)
+            if kind == "pending":
+                continue
+            self.state.pending_orders.pop(symbol, None)
+            if kind == "canceled":
+                log.info("live entry %s for %s canceled or expired before fill", order_id, symbol)
+                self._resolved_entries[symbol] = "entry_canceled"
+                continue
+            logged = self._materialize_pending(symbol, record, order)
+            if logged is None:
+                self._resolved_entries[symbol] = "entry_not_filled"
+            else:
+                self._resolved_entries[symbol] = "entry_filled"
 
     def _pace(self) -> None:
         if self.fetch_delay > 0:
@@ -856,6 +1058,7 @@ class StrategyRunner:
                 last_bars=last_bars,
                 positions=positions,
                 position=legacy_open_slot(positions),
+                pending_orders=self._pending_from_state(raw.get("pending_orders")),
             )
         return RunnerState(
             equity=self.starting_equity,
@@ -884,6 +1087,7 @@ class StrategyRunner:
             if self.state.start_equity is not None
             else self.starting_equity,
             pairs=self.pairs,
+            pending_orders=self.state.pending_orders,
         )
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1026,6 +1230,8 @@ class StrategyRunner:
 
     def cycle(self, *, consult_always: bool = False, now: pd.Timestamp | None = None) -> CycleReport:
         """Evaluate every pair on 1h macro + 15m trigger, then manage the book."""
+        self._resolved_entries = {}
+        self._reconcile_pending_entries()
         if not self.state.positions:
             self.state.positions = empty_position_book(self.pairs)
         for symbol in self.pairs:
@@ -1136,6 +1342,15 @@ class StrategyRunner:
         for item in prepared:
             if item["position"] is not None or item["verdict"] is not None:
                 continue
+            if item["symbol"] in self.state.pending_orders:
+                item["verdict"] = "PENDING"
+                item["reason"] = "entry_pending_fill"
+                continue
+            resolved = self._resolved_entries.get(item["symbol"])
+            if resolved == "entry_canceled":
+                item["verdict"] = "UNFILLED"
+                item["reason"] = "entry_canceled"
+                continue
             if self.state.breaker_active:
                 raw_signal = detect_trigger(
                     item["closed"],
@@ -1195,11 +1410,13 @@ class StrategyRunner:
             signal = item["signal"]
             if signal is None:
                 continue
-            blocked = correlation_block_reason(item["symbol"], self.state.positions)
+            blocked = correlation_block_reason(
+                item["symbol"], self.state.positions, self.state.pending_orders
+            )
             if blocked is not None:
                 item["reason"] = blocked
                 continue
-            if count_open_positions(self.state.positions) >= self.max_open_positions:
+            if self._committed_slots() >= self.max_open_positions:
                 item["reason"] = "max_open_positions"
                 continue
             qty = self.sized_qty(item["symbol"], signal.price)
@@ -1235,24 +1452,51 @@ class StrategyRunner:
             }
             if verdict == "CONFIRMED" and gemini is not None:
                 if not self.paper_trading:
-                    live_qty = self._submit_live_entry(item["symbol"], qty, signal.price)
-                    if live_qty is None:
+                    order = self._submit_live_entry(item["symbol"], qty, signal.price)
+                    if order is None:
+                        item["verdict"] = "REJECTED"
                         item["reason"] = "live_order_rejected"
                         continue
-                    qty = live_qty
+                    kind = classify_order(order)
+                    if kind == "pending":
+                        oid = order_id_of(order)
+                        if not oid:
+                            item["verdict"] = "REJECTED"
+                            item["reason"] = "live_order_unconfirmed"
+                            continue
+                        self.state.pending_orders[item["symbol"]] = build_pending_entry(
+                            order_id=oid,
+                            qty=qty,
+                            price=signal.price,
+                            stop=signal.stop,
+                            target=signal.target,
+                            atr=signal.atr,
+                            action=signal.action,
+                            reason=signal.reason,
+                            opened_bar=item["bar_iso"],
+                            macro_regime=item["macro_regime"],
+                            confidence=gemini.confidence,
+                            model=getattr(self.get_agent(), "last_model_used", None),
+                            rationale=gemini.rationale,
+                            adx=signal.adx,
+                            macro_ema=signal.macro_ema,
+                        )
+                        item["verdict"] = "PENDING"
+                        item["reason"] = "entry_pending_fill"
+                        continue
+                    if kind != "filled":
+                        item["verdict"] = "UNFILLED"
+                        item["reason"] = "entry_not_filled"
+                        continue
+                    qty = filled_qty(order, qty)
+                    signal = self._entry_signal_at(signal, fill_price(order, signal.price))
                 position = self._open_position(
                     item["symbol"], signal, gemini, item["bar_iso"], item["macro_regime"], qty
                 )
                 item["position"] = position
                 extra["stop_loss"] = position.stop
                 extra["take_profit"] = position.target
-                append_row(
-                    self.trade_log,
-                    self._base_row(
-                        signal.action, signal.price, signal, extra, symbol=item["symbol"]
-                    ),
-                )
-                item["logged"] = str(self.trade_log)
+                item["logged"] = self._log_entry(item["symbol"], signal, gemini, position)
             else:
                 append_row(
                     self.reject_log,
@@ -1296,6 +1540,10 @@ class StrategyRunner:
             raise RuntimeError("cycle produced no pair reports")
         primary.legs = legs
         primary.book = _book_status(self.state.positions)
+        primary.pending = {
+            symbol: str(record.get("order_id") or "")
+            for symbol, record in self.state.pending_orders.items()
+        }
         primary.equity = self.state.equity
         primary.breaker_active = self.state.breaker_active
         primary.loss_streak = self.state.loss_streak
@@ -1368,6 +1616,9 @@ def format_report(report: CycleReport) -> str:
     if report.book:
         book = " ".join(f"{symbol}={status}" for symbol, status in report.book.items())
         lines.append(f"book       : {book}")
+    if report.pending:
+        resting = " ".join(f"{symbol}={order_id}" for symbol, order_id in report.pending.items())
+        lines.append(f"pending    : {resting}")
     if len(report.legs) > 1:
         for leg in report.legs:
             lines.append(f"--- {leg.symbol} ---")
@@ -1378,7 +1629,9 @@ def format_report(report: CycleReport) -> str:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Native Gemini Trend Guard paper-trading runner")
+    parser = argparse.ArgumentParser(
+        description="Gemini Trend Guard runner (paper by default; live needs ALLOW_LIVE_TRADING)"
+    )
     parser.add_argument(
         "--once",
         action="store_true",
