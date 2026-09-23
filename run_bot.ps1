@@ -3,6 +3,11 @@
     Starts the paper execution server and a Cloudflare tunnel, then prints the
     public webhook URL to paste into TradingView.
 
+    This process only logs TradingView alerts. It does not submit Kraken
+    orders. The native runner (`python -m core.strategy_runner`) is the
+    process that can spend money, and only when paper mode is off and
+    ALLOW_LIVE_TRADING is true.
+
 .DESCRIPTION
     Both processes are detached and keep running after this script exits. Their
     PIDs are recorded in logs/run_bot.pids so -Stop can tear down exactly what

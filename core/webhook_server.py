@@ -25,10 +25,11 @@ from typing import Any, Literal
 if __package__ in (None, ""):  # allow `python core/webhook_server.py`
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.config import get_settings
+from core.exposure import assert_secret_for_public_bind, request_from_localhost
 from core.gemini_agent import GeminiAgent
 from core.market_data import add_indicators, fetch_ohlcv, latest_snapshot
 from core.net import enable_os_trust_store
@@ -340,12 +341,26 @@ app = FastAPI(
 )
 
 
-def check_token(token: str | None) -> None:
+def check_token(request: Request, token: str | None) -> None:
+    """Empty WEBHOOK_SECRET is allowed only for a localhost client.
+
+    A tunnel header or any other peer must present the secret. When a secret
+    is configured, every caller must present it, including localhost.
+    """
     secret = get_settings().webhook_secret
-    if not secret:
+    if secret:
+        if not token or not secrets.compare_digest(token, secret):
+            raise HTTPException(status_code=401, detail="invalid or missing token")
         return
-    if not token or not secrets.compare_digest(token, secret):
-        raise HTTPException(status_code=401, detail="invalid or missing token")
+    if request_from_localhost(request):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "WEBHOOK_SECRET is required for requests that are not from localhost. "
+            "Set WEBHOOK_SECRET before exposing this endpoint through a tunnel or a public bind."
+        ),
+    )
 
 
 @app.get("/health")
@@ -361,8 +376,12 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/webhook", response_model=ExecutionResult)
-def webhook(alert: TradingViewAlert, token: str | None = Query(default=None)) -> ExecutionResult:
-    check_token(token)
+def webhook(
+    alert: TradingViewAlert,
+    request: Request,
+    token: str | None = Query(default=None),
+) -> ExecutionResult:
+    check_token(request, token)
     log.info("alert: %s %s (%s)", alert.action, alert.ticker, alert.reason)
     result = evaluate(alert)
     log.info("verdict: %s (%s)", result.verdict, result.reason)
@@ -370,7 +389,12 @@ def webhook(alert: TradingViewAlert, token: str | None = Query(default=None)) ->
 
 
 @app.get("/trades")
-def trades(limit: int = Query(default=20, ge=1, le=500)) -> dict[str, Any]:
+def trades(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=500),
+    token: str | None = Query(default=None),
+) -> dict[str, Any]:
+    check_token(request, token)
     path = trade_log_path()
     if not path.exists():
         return {"count": 0, "trades": []}
@@ -384,10 +408,24 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = get_settings()
+    try:
+        assert_secret_for_public_bind(
+            host=cfg.webhook_host,
+            secret=cfg.webhook_secret,
+            service="the TradingView webhook",
+            secret_name="WEBHOOK_SECRET",
+        )
+    except RuntimeError as exc:
+        print(f"Refusing to start: {exc}", file=sys.stderr)
+        return 1
+    if cfg.webhook_secret:
+        auth = "token required"
+    else:
+        auth = "open on localhost only (set WEBHOOK_SECRET before a tunnel or public bind)"
     print(f"Paper execution server on http://{cfg.webhook_host}:{cfg.webhook_port}/webhook")
     print(f"  model          : {cfg.gemini_model}")
     print(f"  min confidence : {cfg.min_confidence}")
-    print(f"  auth           : {'token required' if cfg.webhook_secret else 'OPEN (set WEBHOOK_SECRET)'}")
+    print(f"  auth           : {auth}")
     print(f"  trade log      : {trade_log_path()}")
     uvicorn.run(app, host=cfg.webhook_host, port=cfg.webhook_port, log_level="info")
     return 0

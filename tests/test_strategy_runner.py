@@ -20,9 +20,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.gemini_agent import Decision
+from core.gemini_agent import Decision, system_instruction
 from core.broker import PairLimits, limits_from_market, prepare_order_size, truncate_qty
-from core.config import TRADING_PAIRS
+from core.config import POSITION_SIZE_FRACTION, TRADING_PAIRS
+from core.order_lifecycle import LiveTradingDisabled, classify_order
 from core.market_data import classify_macro_regime
 from core.strategy_runner import (
     Position,
@@ -527,7 +528,7 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     assert eth.reason == "alt_adx_priority"
     assert eth.signal == "BUY"
     btc_qty = runner.state.positions["BTC/USD"]["qty"]
-    assert abs(btc_qty - 0.48) < 1e-9
+    assert abs(btc_qty - POSITION_SIZE_FRACTION) < 1e-9
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
     assert saved["circuit_breaker"]["tripped"] is False
     assert saved["positions"]["BTC/USD"]["status"] == "LONG"
@@ -535,7 +536,7 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     assert saved["positions"]["SOL/USD"]["status"] == "LONG"
     assert saved["positions"]["ETH/USD"]["status"] == "FLAT"
     assert agent.calls == 2
-    print("    scanned 3 pairs x 2 timeframes, opened BTC+SOL, sized 48%")
+    print("    scanned 3 pairs x 2 timeframes, opened BTC+SOL, sized 25%")
 
 
 def test_alt_correlation_blocks_second_alt() -> None:
@@ -679,19 +680,105 @@ def test_below_ordermin_skips_entry() -> None:
     print("    below ordermin skipped")
 
 
+def _ack(status: str, qty: float, price: float, order_id: str = "ord-1", filled: float | None = None) -> dict:
+    if filled is None:
+        filled = qty if status in {"closed", "filled"} else 0.0
+    return {
+        "id": order_id,
+        "status": status,
+        "filled": filled,
+        "amount": qty,
+        "average": price if filled else None,
+        "price": price,
+    }
+
+
+def test_order_classification() -> None:
+    assert classify_order({"id": "1", "status": "open", "filled": 0, "amount": 1}) == "pending"
+    assert classify_order({"id": "1", "status": "closed", "filled": 1, "amount": 1}) == "filled"
+    assert classify_order({"id": "1", "status": "canceled", "filled": 0, "amount": 1}) == "canceled"
+    assert classify_order({"id": "1", "status": "expired", "filled": 0, "amount": 1}) == "canceled"
+    assert classify_order(None) == "canceled"
+    print("    ack classified pending / filled / canceled")
+
+
+def test_gemini_prompt_matches_mode() -> None:
+    paper = system_instruction(paper_trading=True)
+    live = system_instruction(paper_trading=False)
+    assert "Operating mode: paper trading" in paper
+    assert "Operating mode: live trading" in live
+    assert "Operating mode: paper trading" not in live
+    assert "enforced in code" in paper and "enforced in code" in live
+    assert "cannot" in paper.lower()
+    print("    prompt follows paper vs live")
+
+
+def test_live_without_allow_fails_closed() -> None:
+    tmp = tmpdir()
+    called = {"balance": 0, "orders": 0}
+
+    def balance() -> float:
+        called["balance"] += 1
+        return 200.0
+
+    def order_fn(*_args):
+        called["orders"] += 1
+
+    try:
+        runner_for(
+            macro_bull_frame(),
+            trigger_cross_frame(),
+            StubAgent("BUY", 0.9),
+            tmp,
+            paper_trading=False,
+            allow_live_trading=False,
+            balance_fn=balance,
+            order_fn=order_fn,
+        )
+    except LiveTradingDisabled as exc:
+        assert "ALLOW_LIVE_TRADING" in str(exc)
+        assert called == {"balance": 0, "orders": 0}
+        print("    paper off without allow-live placed nothing")
+        return
+    raise AssertionError("expected LiveTradingDisabled")
+
+
+def test_allow_live_does_not_override_paper() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    report = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        StubAgent("BUY", 0.9),
+        tmp,
+        paper_trading=True,
+        allow_live_trading=True,
+        order_fn=lambda *args: orders.append(args),
+    ).cycle(now=NOW)
+    assert orders == []
+    assert report.position == "LONG"
+    print("    paper mode ignored ALLOW_LIVE_TRADING")
+
+
 def test_live_syncs_balance_and_posts_limit() -> None:
     tmp = tmpdir()
     orders: list[tuple] = []
     agent = StubAgent("BUY", 0.9)
+
+    def order_fn(*args):
+        orders.append(args)
+        return _ack("open", args[3], args[4], order_id="pending-1", filled=0)
+
     runner = runner_for(
         macro_bull_frame(),
         trigger_cross_frame(),
         agent,
         tmp,
         paper_trading=False,
+        allow_live_trading=True,
         use_post_only=True,
         balance_fn=lambda: 200.0,
-        order_fn=lambda *args: orders.append(args),
+        order_fn=order_fn,
         pair_limits={
             "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
         },
@@ -699,13 +786,143 @@ def test_live_syncs_balance_and_posts_limit() -> None:
     assert runner.state.equity == 200.0
     assert runner.state.start_equity == 200.0
     report = runner.cycle(now=NOW)
-    assert report.position == "LONG"
+    assert report.position == "FLAT"
+    assert report.reason == "entry_pending_fill"
+    assert report.pending.get("BTC/USD") == "pending-1"
+    assert runner.state.positions["BTC/USD"]["status"] == "FLAT"
+    assert runner.state.pending_orders["BTC/USD"]["order_id"] == "pending-1"
     assert orders and orders[0][0] == "limit"
     assert orders[0][1] == "buy"
     assert orders[0][5] == {"postOnly": True}
-    expected = truncate_qty(200.0 * 0.48 / 10000.0, 8)
+    assert not (tmp / "paper_trades.csv").exists()
+    saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
+    assert saved["pending_orders"]["BTC/USD"]["order_id"] == "pending-1"
+    assert saved["positions"]["BTC/USD"]["status"] == "FLAT"
+    print("    live ack without fill stays pending")
+
+
+def test_live_entry_opens_only_after_fill() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    placed: dict = {}
+    phase = {"fetch": "open"}
+
+    def order_fn(*args):
+        orders.append(args)
+        placed["qty"] = args[3]
+        placed["price"] = args[4]
+        return _ack("open", args[3], args[4], order_id="rest-1", filled=0)
+
+    def fetch(_symbol, order_id):
+        if phase["fetch"] == "open":
+            return _ack("open", placed["qty"], placed["price"], order_id, filled=0)
+        return _ack("closed", placed["qty"], placed["price"], order_id)
+
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        agent,
+        tmp,
+        paper_trading=False,
+        allow_live_trading=True,
+        use_post_only=True,
+        balance_fn=lambda: 200.0,
+        order_fn=order_fn,
+        fetch_order_fn=fetch,
+        pair_limits={
+            "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+        },
+    )
+    first = runner.cycle(now=NOW)
+    assert first.position == "FLAT"
+    assert "BTC/USD" in runner.state.pending_orders
+    phase["fetch"] = "closed"
+    second = runner.cycle(now=NOW)
+    assert second.position == "LONG"
+    assert runner.state.pending_orders == {}
+    expected = truncate_qty(200.0 * POSITION_SIZE_FRACTION / 10000.0, 8)
     assert abs(runner.state.positions["BTC/USD"]["size"] - expected) < 1e-12
-    print("    live balance sync + post-only limit")
+    rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
+    assert len(rows) == 1 and rows[0]["action"] == "BUY"
+    assert len(orders) == 1
+    print("    position opened only after the resting limit filled")
+
+
+def test_live_entry_canceled_clears_pending() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    placed: dict = {}
+
+    def order_fn(*args):
+        orders.append(args)
+        placed["qty"] = args[3]
+        placed["price"] = args[4]
+        return _ack("canceled", args[3], args[4], order_id="dead-1", filled=0)
+
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        StubAgent("BUY", 0.9),
+        tmp,
+        paper_trading=False,
+        allow_live_trading=True,
+        balance_fn=lambda: 200.0,
+        order_fn=order_fn,
+        fetch_order_fn=lambda _symbol, order_id: _ack(
+            "canceled", placed.get("qty", 0.0), placed.get("price", 0.0), order_id, filled=0
+        ),
+        pair_limits={
+            "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+        },
+    )
+    report = runner.cycle(now=NOW)
+    assert report.position == "FLAT"
+    assert report.reason == "entry_not_filled"
+    assert runner.state.pending_orders == {}
+    assert not (tmp / "paper_trades.csv").exists()
+    assert len(orders) == 1
+    print("    canceled ack never opened a slot")
+
+
+def test_live_resting_cancel_on_next_poll() -> None:
+    tmp = tmpdir()
+    orders: list[tuple] = []
+    placed: dict = {}
+
+    def order_fn(*args):
+        orders.append(args)
+        placed["qty"] = args[3]
+        placed["price"] = args[4]
+        return _ack("open", args[3], args[4], order_id="rest-2", filled=0)
+
+    def fetch(_symbol, order_id):
+        return _ack("expired", placed["qty"], placed["price"], order_id, filled=0)
+
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        StubAgent("BUY", 0.9),
+        tmp,
+        paper_trading=False,
+        allow_live_trading=True,
+        balance_fn=lambda: 200.0,
+        order_fn=order_fn,
+        fetch_order_fn=fetch,
+        pair_limits={
+            "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+        },
+    )
+    first = runner.cycle(now=NOW)
+    assert first.position == "FLAT"
+    assert "rest-2" == runner.state.pending_orders["BTC/USD"]["order_id"]
+    second = runner.cycle(now=NOW)
+    assert second.position == "FLAT"
+    assert second.reason == "entry_canceled"
+    assert runner.state.pending_orders == {}
+    assert len(orders) == 1
+    assert not (tmp / "paper_trades.csv").exists()
+    print("    expired resting order cleared without opening")
 
 
 def test_live_anchors_start_equity_and_trade_log_name() -> None:
@@ -722,6 +939,7 @@ def test_live_anchors_start_equity_and_trade_log_name() -> None:
         agent,
         tmp,
         paper_trading=False,
+        allow_live_trading=True,
         balance_fn=lambda: 500.0,
         order_fn=lambda *args: None,
         trade_log=tmp / "live_trades.csv",
@@ -810,6 +1028,7 @@ def test_live_missing_keys_fails_closed_on_startup() -> None:
             agent,
             tmp,
             paper_trading=False,
+            allow_live_trading=True,
             balance_fn=boom,
         )
     except RuntimeError as exc:
@@ -823,15 +1042,23 @@ def test_live_market_exit_on_stop() -> None:
     tmp = tmpdir()
     orders: list[tuple] = []
     agent = StubAgent("BUY", 0.9)
+
+    def order_fn(*args):
+        orders.append(args)
+        if args[0] == "limit":
+            return _ack("closed", args[3], args[4], order_id="entry-1")
+        return {"id": "exit-1", "status": "closed", "filled": args[3], "amount": args[3]}
+
     runner = runner_for(
         macro_bull_frame(),
         trigger_cross_frame(),
         agent,
         tmp,
         paper_trading=False,
+        allow_live_trading=True,
         use_post_only=True,
         balance_fn=lambda: 500.0,
-        order_fn=lambda *args: orders.append(args),
+        order_fn=order_fn,
         pair_limits={
             "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
         },
@@ -888,7 +1115,14 @@ def main() -> int:
         ("bear macro blocks trigger", test_bear_macro_blocks_trigger),
         ("order size clamp", test_order_size_truncates_and_clamps),
         ("below ordermin skip", test_below_ordermin_skips_entry),
-        ("live sync + post-only", test_live_syncs_balance_and_posts_limit),
+        ("order classification", test_order_classification),
+        ("gemini prompt matches mode", test_gemini_prompt_matches_mode),
+        ("live gate fail closed", test_live_without_allow_fails_closed),
+        ("paper wins over allow-live", test_allow_live_does_not_override_paper),
+        ("live ack stays pending", test_live_syncs_balance_and_posts_limit),
+        ("live opens after fill", test_live_entry_opens_only_after_fill),
+        ("live canceled ack", test_live_entry_canceled_clears_pending),
+        ("live expired on next poll", test_live_resting_cancel_on_next_poll),
         ("live start_equity + trade log", test_live_anchors_start_equity_and_trade_log_name),
         ("paper places no order", test_paper_does_not_place_exchange_orders),
         ("restart recovery", test_restart_resumes_open_position_without_duplicate_entry),

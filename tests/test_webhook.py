@@ -64,7 +64,8 @@ def make_client(live: bool) -> httpx.Client:
 
     from core.webhook_server import app
 
-    return TestClient(app)
+    # Loopback client: an empty WEBHOOK_SECRET is allowed only from localhost.
+    return TestClient(app, client=("127.0.0.1", 50000))
 
 
 def post(client, payload: dict, **params) -> httpx.Response:
@@ -290,6 +291,58 @@ def test_malformed_payload_is_rejected(client) -> None:
     assert response.status_code == 422, f"expected validation error, got {response.status_code}"
 
 
+def test_empty_secret_rejects_off_localhost() -> None:
+    """A public peer or a tunnel must not post alerts when the secret is empty."""
+    get_settings.cache_clear()
+    os.environ["WEBHOOK_SECRET"] = ""
+    os.environ["WEBHOOK_HOST"] = "127.0.0.1"
+    try:
+        get_settings.cache_clear()
+        from fastapi.testclient import TestClient
+
+        from core.exposure import assert_secret_for_public_bind
+        from core.webhook_server import app
+
+        remote = TestClient(app, client=("203.0.113.10", 50000))
+        denied = remote.post("/webhook", json=BASE_PAYLOAD)
+        assert denied.status_code == 401
+        assert "WEBHOOK_SECRET" in denied.text
+
+        tunneled = TestClient(app, client=("127.0.0.1", 50000))
+        via_tunnel = tunneled.post("/webhook", json=BASE_PAYLOAD, headers={"cf-ray": "abc"})
+        assert via_tunnel.status_code == 401
+        assert "WEBHOOK_SECRET" in via_tunnel.text
+
+        assert_secret_for_public_bind(
+            host="127.0.0.1",
+            secret="",
+            service="the TradingView webhook",
+            secret_name="WEBHOOK_SECRET",
+        )
+        try:
+            assert_secret_for_public_bind(
+                host="0.0.0.0",
+                secret="",
+                service="the TradingView webhook",
+                secret_name="WEBHOOK_SECRET",
+            )
+        except RuntimeError as exc:
+            assert "WEBHOOK_SECRET" in str(exc)
+        else:
+            raise AssertionError("public webhook bind must fail closed")
+        assert_secret_for_public_bind(
+            host="0.0.0.0",
+            secret="required",
+            service="the TradingView webhook",
+            secret_name="WEBHOOK_SECRET",
+        )
+        print("    empty secret rejected off localhost and on 0.0.0.0")
+    finally:
+        os.environ.pop("WEBHOOK_SECRET", None)
+        os.environ.pop("WEBHOOK_HOST", None)
+        get_settings.cache_clear()
+
+
 def test_auth_gate(client) -> None:
     """With a secret configured, an unauthenticated post must be refused."""
     get_settings.cache_clear()
@@ -360,6 +413,7 @@ def main() -> int:
         ("rejections logged separately", lambda: test_rejected_alerts_are_logged_separately(client)),
         ("live entry alert reviewed", lambda: test_entry_alert_is_reviewed(client)),
         ("confirmed trades logged to CSV", lambda: test_confirmed_trades_are_logged()),
+        ("empty secret is localhost-only", lambda: test_empty_secret_rejects_off_localhost()),
         ("auth gate", lambda: test_auth_gate(client)),
     ]
 

@@ -2,7 +2,7 @@
 
 Two responsibilities:
   * `ping()`   - cheap liveness/credential check used by the test suite.
-  * `decide()` - schema-constrained trading decision for the paper-trading loop.
+  * `decide()` - schema-constrained trading decision for the runner.
 """
 
 from __future__ import annotations
@@ -54,7 +54,28 @@ Output rules:
   indicators conflict, return HOLD with low confidence.
 - rationale is at most two sentences and must cite the regime when it forces
   the decision.
-This is a paper-trading simulation, not financial advice."""
+
+Hard risk limits are enforced in code, not by this response. You cannot
+override position size, the circuit breaker, the altcoin correlation cap,
+spot long-only, or post-only entries. Return only the JSON decision."""
+
+PAPER_MODE_NOTE = (
+    "Operating mode: paper trading. Entries and exits are simulated locally "
+    "and are not sent to the exchange. This is not financial advice."
+)
+
+LIVE_MODE_NOTE = (
+    "Operating mode: live trading. A confirmed decision may be followed by a "
+    "real exchange order placed by the strategy runner, and only when the "
+    "runner's own live gate allows it. You still cannot place, cancel, or "
+    "resize orders yourself. This is not financial advice."
+)
+
+
+def system_instruction(*, paper_trading: bool) -> str:
+    """Prompt body plus the mode the process is actually running in."""
+    note = PAPER_MODE_NOTE if paper_trading else LIVE_MODE_NOTE
+    return f"{SYSTEM_INSTRUCTION}\n{note}"
 
 #: Transient overload / rate-limit statuses worth retrying.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -88,9 +109,15 @@ class Decision:
 
 
 class GeminiAgent:
-    def __init__(self, model: str | None = None, timeout_ms: int | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        timeout_ms: int | None = None,
+        paper_trading: bool | None = None,
+    ) -> None:
         enable_os_trust_store()  # before the client builds its SSL context
         cfg = get_settings()
+        self.paper_trading = bool(cfg.paper_trading) if paper_trading is None else bool(paper_trading)
         self.model = model or cfg.gemini_model
         self.timeout_ms = timeout_ms or cfg.gemini_timeout_ms
         self.model_chain = (self.model,) + tuple(
@@ -205,7 +232,7 @@ class GeminiAgent:
         response = self._generate(
             contents,
             types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
+                system_instruction=system_instruction(paper_trading=self.paper_trading),
                 temperature=0.2,
                 thinking_config=types.ThinkingConfig(thinking_level="low"),
                 response_mime_type="application/json",

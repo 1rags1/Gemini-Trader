@@ -1,8 +1,9 @@
 """Read-only dashboard for the paper / live Kraken runner.
 
-Serves a single Tailwind page on 0.0.0.0:8050 and a JSON snapshot the browser
-polls every 10 seconds. File reads are short-lived and shared, so this process
-never locks `state/runner.json` or the trade CSV away from the runner.
+Serves a single Tailwind page on 127.0.0.1:8050 and a JSON snapshot the browser
+polls every 10 seconds. Binding another host requires DASHBOARD_SECRET (or
+WEBHOOK_SECRET). File reads are short-lived and shared, so this process never
+locks `state/runner.json` or the trade CSV away from the runner.
 
     python -m core.dashboard
 """
@@ -14,6 +15,7 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import secrets
 import sys
@@ -46,11 +48,12 @@ from core.market_data import (
     classify_macro_regime,
     fetch_ohlcv,
 )
+from core.exposure import assert_secret_for_public_bind, request_from_localhost
 from core.net import enable_os_trust_store
 
 log = logging.getLogger("dashboard")
 
-DASHBOARD_HOST = "0.0.0.0"
+DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 8050
 TRADE_LIMIT = 15
 MARKET_CACHE_TTL = 20.0
@@ -108,30 +111,30 @@ def desk_labels(*, paper: bool | None = None) -> dict[str, Any]:
 
 
 def dashboard_secret() -> str:
+    """Dashboard token, falling back to the webhook secret.
+
+    If settings cannot load (for example a missing Gemini key), still honor
+    DASHBOARD_SECRET / WEBHOOK_SECRET from the environment so a public bind
+    does not lose its lock.
+    """
     cfg = _cfg()
-    if cfg is None:
-        return ""
-    return (getattr(cfg, "dashboard_secret", None) or cfg.webhook_secret or "").strip()
-
-
-#: Headers Cloudflare/cloudflared attach. A laptop browser talking to
-#: 127.0.0.1 will not send these; a phone hitting the tunnel will.
-_TUNNEL_HEADERS = ("cf-ray", "cf-connecting-ip", "cdn-loop")
-
-
-def is_tunneled(request: Request) -> bool:
-    return any(request.headers.get(name) for name in _TUNNEL_HEADERS)
+    if cfg is not None:
+        return (getattr(cfg, "dashboard_secret", None) or cfg.webhook_secret or "").strip()
+    return (os.getenv("DASHBOARD_SECRET") or os.getenv("WEBHOOK_SECRET") or "").strip()
 
 
 def check_token(request: Request, token: str | None) -> None:
-    """Require a token only for the public tunnel, not for localhost."""
-    if not is_tunneled(request):
+    """Localhost is open. A tunnel or any other peer needs a dashboard secret."""
+    if request_from_localhost(request):
         return
     secret = dashboard_secret()
     if not secret:
         raise HTTPException(
             status_code=401,
-            detail="set DASHBOARD_SECRET or WEBHOOK_SECRET before tunneling",
+            detail=(
+                "DASHBOARD_SECRET or WEBHOOK_SECRET is required off localhost. "
+                "Set one before binding 0.0.0.0 or opening a tunnel."
+            ),
         )
     if not token or not secrets.compare_digest(token, secret):
         raise HTTPException(status_code=401, detail="invalid or missing token")
@@ -792,22 +795,41 @@ def snapshot(request: Request, token: str | None = Query(default=None)) -> dict[
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Read-only paper-trading dashboard")
-    parser.add_argument("--host", default=DASHBOARD_HOST)
+    parser = argparse.ArgumentParser(description="Read-only paper/live dashboard (localhost by default)")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind address (default 127.0.0.1, or DASHBOARD_HOST). 0.0.0.0 requires a secret.",
+    )
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT)
     args = parser.parse_args(argv)
+    _cfg()  # load .env so DASHBOARD_HOST / secrets are visible
+    host = args.host or os.getenv("DASHBOARD_HOST") or DASHBOARD_HOST
 
     import uvicorn
 
     enable_os_trust_store()
     secret = dashboard_secret()
-    auth = "token required (?token=)" if secret else "OPEN — set DASHBOARD_SECRET before tunneling"
-    print(f"Dashboard on http://{args.host}:{args.port}  (read-only, {auth})")
+    try:
+        assert_secret_for_public_bind(
+            host=host,
+            secret=secret,
+            service="the dashboard",
+            secret_name="DASHBOARD_SECRET",
+        )
+    except RuntimeError as exc:
+        print(f"Refusing to start: {exc}", file=sys.stderr)
+        return 1
+    if secret:
+        auth = "token required off localhost (?token=)"
+    else:
+        auth = "open on localhost only (set DASHBOARD_SECRET before a public bind or tunnel)"
+    print(f"Dashboard on http://{host}:{args.port}  (read-only, {auth})")
     if secret:
         print(f"  local bookmark : http://127.0.0.1:{args.port}/?token=<DASHBOARD_SECRET or WEBHOOK_SECRET>")
         print(f"  phone          : cloudflared tunnel --url http://localhost:{args.port}")
         print("                  then open https://<printed-host>/?token=<same secret>")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=host, port=args.port, log_level="info")
     return 0
 
 

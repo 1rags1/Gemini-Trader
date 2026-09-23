@@ -165,6 +165,18 @@ def place_limit_entry(
     return exchange.create_order(symbol, "limit", "buy", amount, price, params)
 
 
+def fetch_order(
+    exchange_id: str,
+    api_key: str,
+    secret: str,
+    order_id: str,
+    symbol: str,
+) -> dict[str, Any]:
+    """Fetch one live order so a resting limit can be reconciled."""
+    exchange = _private_exchange(exchange_id, api_key, secret)
+    return exchange.fetch_order(order_id, symbol)
+
+
 def place_market_exit(
     exchange_id: str,
     api_key: str,
