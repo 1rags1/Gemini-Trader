@@ -40,7 +40,7 @@ DEFAULT_TIMEOUT_MS = 20_000
 
 #: Universe the runner scans each cycle. Override with TRADING_PAIRS in .env
 #: as a comma-separated list.
-TRADING_PAIRS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+TRADING_PAIRS = ("BTC/USD", "ETH/USD", "SOL/USD")
 
 #: 1h candles gate the tradeable direction. 15m candles fire the pullback.
 MACRO_TIMEFRAME = "1h"
@@ -89,7 +89,7 @@ class Settings:
     gemini_timeout_ms: int = DEFAULT_TIMEOUT_MS
     gemini_fallback_models: tuple[str, ...] = DEFAULT_FALLBACK_MODELS
     exchange_id: str = DEFAULT_EXCHANGE
-    symbol: str = "BTC/USDT"
+    symbol: str = "BTC/USD"
     trading_pairs: tuple[str, ...] = TRADING_PAIRS
     macro_timeframe: str = MACRO_TIMEFRAME
     trigger_timeframe: str = TRIGGER_TIMEFRAME
@@ -242,7 +242,7 @@ def migrate_position_book(raw: dict, pairs: tuple[str, ...] | None = None) -> di
     if isinstance(legacy, dict):
         status = str(legacy.get("status") or legacy.get("side") or "FLAT").upper()
         if status not in {"", "FLAT"}:
-            symbol = legacy.get("symbol") or (pairs[0] if pairs else "BTC/USDT")
+            symbol = legacy.get("symbol") or (pairs[0] if pairs else "BTC/USD")
             book[symbol] = hydrate_position_slot({**legacy, "status": status, "symbol": symbol})
     return book
 
@@ -324,7 +324,7 @@ def get_settings() -> Settings:
         gemini_timeout_ms=int(os.getenv("GEMINI_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS))),
         gemini_fallback_models=_csv_env("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS),
         exchange_id=os.getenv("EXCHANGE_ID", DEFAULT_EXCHANGE),
-        symbol=os.getenv("SYMBOL", "BTC/USDT"),
+        symbol=os.getenv("SYMBOL", "BTC/USD"),
         trading_pairs=_csv_env("TRADING_PAIRS", TRADING_PAIRS),
         macro_timeframe=os.getenv("MACRO_TIMEFRAME", MACRO_TIMEFRAME),
         trigger_timeframe=trigger,

@@ -113,7 +113,7 @@ def _row(
 def make_frame(rows: list[dict], *, freq: str = "h", start: pd.Timestamp | None = None, timeframe: str = "1h") -> pd.DataFrame:
     idx = pd.date_range(start or START, periods=len(rows), freq=freq, tz="UTC")
     df = pd.DataFrame(rows, index=idx)
-    df.attrs.update(symbol="BTC/USDT", timeframe=timeframe, exchange="kraken")
+    df.attrs.update(symbol="BTC/USD", timeframe=timeframe, exchange="kraken")
     return df
 
 
@@ -193,7 +193,7 @@ def runner_for(
         indicate_fn=lambda df: df,
         params=PARAMS,
         strategy_context="test",
-        symbol=kwargs.pop("symbol", "BTC/USDT"),
+        symbol=kwargs.pop("symbol", "BTC/USD"),
         timeframe="15m",
         exchange_id="kraken",
         min_confidence=0.6,
@@ -201,7 +201,7 @@ def runner_for(
         trade_log=tmp / "paper_trades.csv",
         reject_log=tmp / "rejected_alerts.csv",
         state_path=tmp / "runner.json",
-        pairs=kwargs.pop("pairs", ("BTC/USDT",)),
+        pairs=kwargs.pop("pairs", ("BTC/USD",)),
         fetch_delay=kwargs.pop("fetch_delay", 0),
         **kwargs,
     )
@@ -494,9 +494,9 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     fetched: list[tuple[str, str]] = []
     # Equal ADX: alt winner is SOL (tie-break by symbol). BTC fills first.
     macros = {
-        "BTC/USDT": macro_bull_frame(adx=25),
-        "ETH/USDT": macro_bull_frame(adx=25),
-        "SOL/USDT": macro_bull_frame(adx=25),
+        "BTC/USD": macro_bull_frame(adx=25),
+        "ETH/USD": macro_bull_frame(adx=25),
+        "SOL/USD": macro_bull_frame(adx=25),
     }
     trigger = trigger_cross_frame()
 
@@ -506,7 +506,7 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
 
     agent = StubAgent("BUY", 0.9)
     runner = runner_for(
-        macros["BTC/USDT"],
+        macros["BTC/USD"],
         trigger,
         agent,
         tmp,
@@ -519,21 +519,21 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
         (symbol, tf) for symbol in TRADING_PAIRS for tf in ("1h", "15m")
     ]
     assert len(report.legs) == 3
-    assert report.book["BTC/USDT"] == "LONG"
-    assert report.book["SOL/USDT"] == "LONG"
-    assert report.book["ETH/USDT"] == "FLAT"
+    assert report.book["BTC/USD"] == "LONG"
+    assert report.book["SOL/USD"] == "LONG"
+    assert report.book["ETH/USD"] == "FLAT"
     assert count_open_positions(runner.state.positions) == 2
-    eth = next(leg for leg in report.legs if leg.symbol == "ETH/USDT")
+    eth = next(leg for leg in report.legs if leg.symbol == "ETH/USD")
     assert eth.reason == "alt_adx_priority"
     assert eth.signal == "BUY"
-    btc_qty = runner.state.positions["BTC/USDT"]["qty"]
+    btc_qty = runner.state.positions["BTC/USD"]["qty"]
     assert abs(btc_qty - 0.48) < 1e-9
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
     assert saved["circuit_breaker"]["tripped"] is False
-    assert saved["positions"]["BTC/USDT"]["status"] == "LONG"
-    assert saved["positions"]["BTC/USDT"]["size"] == btc_qty
-    assert saved["positions"]["SOL/USDT"]["status"] == "LONG"
-    assert saved["positions"]["ETH/USDT"]["status"] == "FLAT"
+    assert saved["positions"]["BTC/USD"]["status"] == "LONG"
+    assert saved["positions"]["BTC/USD"]["size"] == btc_qty
+    assert saved["positions"]["SOL/USD"]["status"] == "LONG"
+    assert saved["positions"]["ETH/USD"]["status"] == "FLAT"
     assert agent.calls == 2
     print("    scanned 3 pairs x 2 timeframes, opened BTC+SOL, sized 48%")
 
@@ -542,9 +542,9 @@ def test_alt_correlation_blocks_second_alt() -> None:
     tmp = tmpdir()
     agent = StubAgent("BUY", 0.9)
     macros = {
-        "BTC/USDT": macro_bull_frame(adx=20),
-        "ETH/USDT": macro_bull_frame(adx=30),
-        "SOL/USDT": macro_bull_frame(adx=40),
+        "BTC/USD": macro_bull_frame(adx=20),
+        "ETH/USD": macro_bull_frame(adx=30),
+        "SOL/USD": macro_bull_frame(adx=40),
     }
     trigger = trigger_cross_frame()
 
@@ -553,7 +553,7 @@ def test_alt_correlation_blocks_second_alt() -> None:
 
     # Seed an open ETH slot with room left under MAX_OPEN_POSITIONS.
     runner = runner_for(
-        macros["BTC/USDT"],
+        macros["BTC/USD"],
         trigger,
         agent,
         tmp,
@@ -561,7 +561,7 @@ def test_alt_correlation_blocks_second_alt() -> None:
         pairs=TRADING_PAIRS,
         fetch_delay=0,
     )
-    runner.state.positions["ETH/USDT"] = {
+    runner.state.positions["ETH/USD"] = {
         "status": "LONG",
         "side": "LONG",
         "entry_price": 10000,
@@ -576,12 +576,12 @@ def test_alt_correlation_blocks_second_alt() -> None:
         "macro_regime": "BULL",
     }
     report = runner.cycle(now=NOW)
-    assert report.book["ETH/USDT"] == "LONG"
-    assert report.book["BTC/USDT"] == "LONG"
-    assert report.book["SOL/USDT"] == "FLAT"
-    sol = next(leg for leg in report.legs if leg.symbol == "SOL/USDT")
+    assert report.book["ETH/USD"] == "LONG"
+    assert report.book["BTC/USD"] == "LONG"
+    assert report.book["SOL/USD"] == "FLAT"
+    sol = next(leg for leg in report.legs if leg.symbol == "SOL/USD")
     assert sol.reason == "alt_correlation_cap"
-    assert correlation_block_reason("SOL/USDT", runner.state.positions) == "alt_correlation_cap"
+    assert correlation_block_reason("SOL/USD", runner.state.positions) == "alt_correlation_cap"
     print("    ETH open blocked SOL; BTC still filled")
 
 
@@ -591,9 +591,9 @@ def test_same_bar_alts_prefer_higher_adx() -> None:
     # Flat BTC frame so only alts compete for a single open slot.
     flat_btc = make_frame([_row(10000, 110, 100, adx=18, ema_macro=9000)] * 6)
     macros = {
-        "BTC/USDT": flat_btc,
-        "ETH/USDT": macro_bull_frame(adx=22),
-        "SOL/USDT": macro_bull_frame(adx=35),
+        "BTC/USD": flat_btc,
+        "ETH/USD": macro_bull_frame(adx=22),
+        "SOL/USD": macro_bull_frame(adx=35),
     }
     trigger = trigger_cross_frame()
     flat_trigger = trigger_flat_frame()
@@ -601,12 +601,12 @@ def test_same_bar_alts_prefer_higher_adx() -> None:
     def fetch(*, symbol: str, timeframe: str, **_k):
         if timeframe == "1h":
             return macros[symbol].copy()
-        if symbol == "BTC/USDT":
+        if symbol == "BTC/USD":
             return flat_trigger.copy()
         return trigger.copy()
 
     runner = runner_for(
-        macros["BTC/USDT"],
+        macros["BTC/USD"],
         trigger,
         agent,
         tmp,
@@ -615,18 +615,18 @@ def test_same_bar_alts_prefer_higher_adx() -> None:
         fetch_delay=0,
     )
     report = runner.cycle(now=NOW)
-    assert report.book["SOL/USDT"] == "LONG"
-    assert report.book["ETH/USDT"] == "FLAT"
-    assert report.book["BTC/USDT"] == "FLAT"
-    eth = next(leg for leg in report.legs if leg.symbol == "ETH/USDT")
+    assert report.book["SOL/USD"] == "LONG"
+    assert report.book["ETH/USD"] == "FLAT"
+    assert report.book["BTC/USD"] == "FLAT"
+    eth = next(leg for leg in report.legs if leg.symbol == "ETH/USD")
     assert eth.reason == "alt_adx_priority"
     winner = select_alt_entry_winner(
         [
-            {"symbol": "ETH/USDT", "signal": type("S", (), {"adx": 22})()},
-            {"symbol": "SOL/USDT", "signal": type("S", (), {"adx": 35})()},
+            {"symbol": "ETH/USD", "signal": type("S", (), {"adx": 22})()},
+            {"symbol": "SOL/USD", "signal": type("S", (), {"adx": 35})()},
         ]
     )
-    assert winner is not None and winner["symbol"] == "SOL/USDT"
+    assert winner is not None and winner["symbol"] == "SOL/USD"
     print("    same-bar alts: SOL (ADX 35) beat ETH (ADX 22)")
 
 
@@ -647,7 +647,7 @@ def test_breaker_blocks_entry() -> None:
 def test_order_size_truncates_and_clamps() -> None:
     assert truncate_qty(0.123456789, 5) == 0.12345
     assert truncate_qty(1.999, 0) == 1.0
-    limits = PairLimits("BTC/USDT", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+    limits = PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
     assert prepare_order_size(0.00012, limits) == 0.00012
     assert prepare_order_size(0.00001, limits) is None
     market = {
@@ -655,7 +655,7 @@ def test_order_size_truncates_and_clamps() -> None:
         "limits": {"amount": {"min": 0.01}},
         "precision": {"amount": 8, "price": 1},
     }
-    parsed = limits_from_market("ETH/USDT", market)
+    parsed = limits_from_market("ETH/USD", market)
     assert parsed.ordermin == 0.002
     assert parsed.lot_decimals == 5
     assert parsed.pair_decimals == 2
@@ -665,7 +665,7 @@ def test_order_size_truncates_and_clamps() -> None:
 def test_below_ordermin_skips_entry() -> None:
     tmp = tmpdir()
     agent = StubAgent("BUY", 0.9)
-    limits = {"BTC/USDT": PairLimits("BTC/USDT", ordermin=1.0, lot_decimals=8, pair_decimals=1)}
+    limits = {"BTC/USD": PairLimits("BTC/USD", ordermin=1.0, lot_decimals=8, pair_decimals=1)}
     report = runner_for(
         macro_bull_frame(),
         trigger_cross_frame(),
@@ -693,7 +693,7 @@ def test_live_syncs_balance_and_posts_limit() -> None:
         balance_fn=lambda: 200.0,
         order_fn=lambda *args: orders.append(args),
         pair_limits={
-            "BTC/USDT": PairLimits("BTC/USDT", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+            "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
         },
     )
     assert runner.state.equity == 200.0
@@ -703,7 +703,7 @@ def test_live_syncs_balance_and_posts_limit() -> None:
     assert orders[0][1] == "buy"
     assert orders[0][5] == {"postOnly": True}
     expected = truncate_qty(200.0 * 0.48 / 10000.0, 8)
-    assert abs(runner.state.positions["BTC/USDT"]["size"] - expected) < 1e-12
+    assert abs(runner.state.positions["BTC/USD"]["size"] - expected) < 1e-12
     print("    live balance sync + post-only limit")
 
 
@@ -730,19 +730,19 @@ def test_restart_resumes_open_position_without_duplicate_entry() -> None:
     first = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
     opened = first.cycle(now=NOW)
     assert opened.position == "LONG"
-    assert first.state.positions["BTC/USDT"]["status"] == "LONG"
+    assert first.state.positions["BTC/USD"]["status"] == "LONG"
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
-    assert saved["positions"]["BTC/USDT"]["status"] == "LONG"
-    assert saved["positions"]["BTC/USDT"]["stop_loss"] == 9850
-    assert saved["positions"]["BTC/USDT"]["take_profit"] == 10350
-    assert "BTC/USDT" in saved.get("last_bars", {})
+    assert saved["positions"]["BTC/USD"]["status"] == "LONG"
+    assert saved["positions"]["BTC/USD"]["stop_loss"] == 9850
+    assert saved["positions"]["BTC/USD"]["take_profit"] == 10350
+    assert "BTC/USD" in saved.get("last_bars", {})
     equity_before = saved["equity"]
 
     agent2 = StubAgent("BUY", 0.9)
     restarted = runner_for(macro_bull_frame(), trigger_cross_frame(), agent2, tmp)
-    assert restarted.state.positions["BTC/USDT"]["status"] == "LONG"
+    assert restarted.state.positions["BTC/USD"]["status"] == "LONG"
     assert abs(restarted.state.equity - equity_before) < 1e-9
-    assert restarted.state.last_bars.get("BTC/USDT") == saved["last_bars"]["BTC/USDT"]
+    assert restarted.state.last_bars.get("BTC/USD") == saved["last_bars"]["BTC/USD"]
 
     # Same closed bar: must hold, not fire a second BUY.
     again = restarted.cycle(now=NOW)
@@ -804,7 +804,7 @@ def test_live_market_exit_on_stop() -> None:
         balance_fn=lambda: 500.0,
         order_fn=lambda *args: orders.append(args),
         pair_limits={
-            "BTC/USDT": PairLimits("BTC/USDT", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
+            "BTC/USD": PairLimits("BTC/USD", ordermin=0.0001, lot_decimals=8, pair_decimals=1)
         },
     )
     runner.cycle(now=NOW)

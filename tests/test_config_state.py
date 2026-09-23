@@ -37,7 +37,7 @@ from core.config import (
 
 
 def test_mtf_defaults() -> None:
-    assert TRADING_PAIRS == ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+    assert TRADING_PAIRS == ("BTC/USD", "ETH/USD", "SOL/USD")
     assert MACRO_TIMEFRAME == "1h"
     assert TRIGGER_TIMEFRAME == "15m"
     assert POLL_INTERVAL_SECONDS == 30
@@ -80,7 +80,7 @@ def test_migrate_legacy_book_and_breaker() -> None:
         "breaker_active": True,
         "position": {
             "side": "LONG",
-            "symbol": "BTC/USDT",
+            "symbol": "BTC/USD",
             "entry_price": 77000,
             "qty": 0.1,
             "stop": 76000,
@@ -89,14 +89,14 @@ def test_migrate_legacy_book_and_breaker() -> None:
         },
     }
     book = migrate_position_book(raw)
-    btc = book["BTC/USDT"]
+    btc = book["BTC/USD"]
     assert btc["status"] == "LONG"
     assert btc["size"] == 0.1
     assert btc["stop_loss"] == 76000
     assert btc["take_profit"] == 80000
     assert btc["entry_time"] == "2026-09-11T16:00:00+00:00"
     assert btc["macro_regime"] == "BULL"
-    assert book["ETH/USDT"]["status"] == "FLAT"
+    assert book["ETH/USD"]["status"] == "FLAT"
     breaker = migrate_circuit_breaker(raw)
     assert breaker == {"loss_streak": 2, "tripped": True}
     print("    legacy position + breaker migrated")
@@ -106,7 +106,7 @@ def test_dump_canonical_state() -> None:
     payload = dump_runner_state(
         equity=10000,
         positions={
-            "ETH/USDT": {
+            "ETH/USD": {
                 "status": "LONG",
                 "qty": 1.5,
                 "entry_price": 2500,
@@ -119,7 +119,7 @@ def test_dump_canonical_state() -> None:
         pairs=TRADING_PAIRS,
     )
     assert set(payload["positions"]) == set(TRADING_PAIRS)
-    eth = payload["positions"]["ETH/USDT"]
+    eth = payload["positions"]["ETH/USD"]
     assert eth == {
         "status": "LONG",
         "entry_price": 2500.0,

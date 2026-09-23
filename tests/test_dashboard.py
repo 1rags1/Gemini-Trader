@@ -30,14 +30,14 @@ def test_enrich_trade_keeps_symbol() -> None:
     row = _enrich_trade(
         {
             "timestamp": "2026-09-11T00:00:00+00:00",
-            "symbol": "ETH/USDT",
+            "symbol": "ETH/USD",
             "action": "BUY",
             "verdict": "CONFIRMED",
             "entry_price": "2500",
             "rationale": "entry=2500 fill=2510 pnl=1.2 hit=target",
         }
     )
-    assert row["symbol"] == "ETH/USDT"
+    assert row["symbol"] == "ETH/USD"
     assert row["action"] == "BUY"
     print("    trade symbol retained")
 
@@ -52,12 +52,12 @@ def test_read_positions_book() -> None:
                 "circuit_breaker": {"loss_streak": 1, "tripped": False},
                 "last_bar": "2026-09-11T16:00:00+00:00",
                 "last_bars": {
-                    "BTC/USDT": "2026-09-11T16:00:00+00:00",
-                    "ETH/USDT": "2026-09-11T16:00:00+00:00",
-                    "SOL/USDT": "2026-09-11T15:00:00+00:00",
+                    "BTC/USD": "2026-09-11T16:00:00+00:00",
+                    "ETH/USD": "2026-09-11T16:00:00+00:00",
+                    "SOL/USD": "2026-09-11T15:00:00+00:00",
                 },
                 "positions": {
-                    "BTC/USDT": {
+                    "BTC/USD": {
                         "status": "LONG",
                         "side": "LONG",
                         "entry_price": 77000,
@@ -66,8 +66,8 @@ def test_read_positions_book() -> None:
                         "trail_stop": 76000,
                         "qty": 0.33,
                     },
-                    "ETH/USDT": {"status": "FLAT"},
-                    "SOL/USDT": {"status": "SHORT", "side": "SHORT", "entry_price": 100},
+                    "ETH/USD": {"status": "FLAT"},
+                    "SOL/USD": {"status": "SHORT", "side": "SHORT", "entry_price": 100},
                 },
             }
         ),
@@ -84,10 +84,10 @@ def test_read_positions_book() -> None:
         dash._paths = original
 
     by_symbol = {card["symbol"]: card for card in state["positions"]}
-    assert list(by_symbol) == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    assert by_symbol["BTC/USDT"]["status"] == "LONG"
-    assert by_symbol["ETH/USDT"]["status"] == "FLAT"
-    assert by_symbol["SOL/USDT"]["status"] == "SHORT"
+    assert list(by_symbol) == ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert by_symbol["BTC/USD"]["status"] == "LONG"
+    assert by_symbol["ETH/USD"]["status"] == "FLAT"
+    assert by_symbol["SOL/USD"]["status"] == "SHORT"
     assert state["open_count"] == 2
     assert state["max_open_positions"] == 2
     assert state["position"]["entry_price"] == 77000

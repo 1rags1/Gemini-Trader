@@ -75,8 +75,8 @@ MACRO_CANDLES = 250
 TRIGGER_CANDLES = 100
 
 #: Spot book: at most one of these alts can be open alongside BTC (or alone).
-ALT_SYMBOLS = frozenset({"ETH/USDT", "SOL/USDT"})
-BTC_SYMBOL = "BTC/USDT"
+ALT_SYMBOLS = frozenset({"ETH/USD", "SOL/USD"})
+BTC_SYMBOL = "BTC/USD"
 
 TRADE_LOG_FIELDS = [
     "timestamp", "symbol", "action", "entry_price", "stop_loss", "take_profit",
@@ -1354,7 +1354,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "on a new closed trigger bar; polls also catch intra-bar stop/target hits."
         ),
     )
-    parser.add_argument("--symbol", default=None, help="Override SYMBOL (default from .env, BTC/USDT)")
+    parser.add_argument("--symbol", default=None, help="Override SYMBOL (default from .env, BTC/USD)")
     parser.add_argument("--timeframe", default=None, help="Override trigger timeframe (default 15m)")
     parser.add_argument("--exchange", default=None, help="Override EXCHANGE_ID (default kraken)")
     return parser.parse_args(argv)

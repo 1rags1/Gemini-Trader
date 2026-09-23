@@ -16,7 +16,8 @@ from core.net import enable_os_trust_store
 
 log = logging.getLogger("broker")
 
-QUOTE_CANDIDATES = ("USDT", "USD")
+#: Prefer USD (spot funding), then USDT if that is what the account holds.
+QUOTE_CANDIDATES = ("USD", "USDT")
 
 
 @dataclass(frozen=True)
@@ -116,7 +117,7 @@ def load_pair_limits(
 
 
 def free_quote_balance(balance: dict[str, Any]) -> float:
-    """Prefer free USDT, then USD, from a ccxt `fetch_balance()` payload."""
+    """Prefer free USD, then USDT, from a ccxt `fetch_balance()` payload."""
     free = balance.get("free") if isinstance(balance.get("free"), dict) else {}
     total = balance.get("total") if isinstance(balance.get("total"), dict) else {}
     for currency in QUOTE_CANDIDATES:
