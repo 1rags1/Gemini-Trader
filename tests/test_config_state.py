@@ -117,7 +117,7 @@ def test_migrate_legacy_book_and_breaker() -> None:
     assert btc["macro_regime"] == "BULL"
     assert book["ETH/USD"]["status"] == "FLAT"
     breaker = migrate_circuit_breaker(raw)
-    assert breaker == {"loss_streak": 2, "tripped": True}
+    assert breaker == {"loss_streak": 2, "tripped": True, "cooldown_bars": 0}
     print("    legacy position + breaker migrated")
 
 
@@ -148,7 +148,7 @@ def test_dump_canonical_state() -> None:
         "entry_time": "bar-1",
         "macro_regime": "BULL",
     }
-    assert payload["circuit_breaker"] == {"loss_streak": 0, "tripped": False}
+    assert payload["circuit_breaker"] == {"loss_streak": 0, "tripped": False, "cooldown_bars": 0}
     assert "qty" not in eth
     print("    dump uses MTF slot fields")
 
@@ -157,6 +157,13 @@ def test_on_disk_runner_json() -> None:
     path = PROJECT_ROOT / "state" / "runner.json"
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert "circuit_breaker" in raw
+    assert raw["circuit_breaker"] == {
+        "loss_streak": 0,
+        "tripped": False,
+        "cooldown_bars": 0,
+    }
+    assert raw.get("start_equity") == 500.0
+    assert raw.get("equity") == 500.0
     assert set(raw["positions"]) == set(TRADING_PAIRS)
     for symbol, slot in raw["positions"].items():
         canonical = canonical_position_slot(slot)

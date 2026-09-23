@@ -11,11 +11,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.dashboard import PAGE, DASHBOARD_HOST, DASHBOARD_PORT, _enrich_trade, read_runner_state
+from core.dashboard import (
+    PAGE,
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
+    _enrich_trade,
+    desk_labels,
+    read_runner_state,
+)
 
 
 def test_page_has_multi_pair_surfaces() -> None:
     assert 'id="pair-cards"' in PAGE
+    assert 'id="desk-title"' in PAGE
+    assert 'id="live-badge"' in PAGE
+    assert 'id="equity-label"' in PAGE
+    assert "Live Execution Desk" in PAGE
+    assert "LIVE KRAKEN EQUITY" in PAGE
+    assert "PAPER EQUITY" in PAGE
+    assert "● LIVE KRAKEN (USD)" in PAGE
     assert ">Symbol</th>" in PAGE
     assert ">1h Regime</th>" in PAGE
     assert ">EMA 9</th>" in PAGE
@@ -24,6 +38,18 @@ def test_page_has_multi_pair_surfaces() -> None:
     assert DASHBOARD_HOST == "0.0.0.0"
     assert DASHBOARD_PORT == 8050
     print("    page + bind defaults")
+
+
+def test_desk_labels_toggle() -> None:
+    paper = desk_labels(paper=True)
+    assert paper["desk_title"] == "Paper desk"
+    assert paper["equity_label"] == "PAPER EQUITY"
+    assert paper["live_badge"] is None
+    live = desk_labels(paper=False)
+    assert live["desk_title"] == "Live Execution Desk"
+    assert live["equity_label"] == "LIVE KRAKEN EQUITY"
+    assert live["live_badge"] == "● LIVE KRAKEN (USD)"
+    print("    paper/live desk labels")
 
 
 def test_enrich_trade_keeps_symbol() -> None:
@@ -48,8 +74,9 @@ def test_read_positions_book() -> None:
     state_path.write_text(
         json.dumps(
             {
-                "equity": 10100.0,
-                "circuit_breaker": {"loss_streak": 1, "tripped": False},
+                "equity": 500.0,
+                "start_equity": 500.0,
+                "circuit_breaker": {"loss_streak": 0, "tripped": False, "cooldown_bars": 0},
                 "last_bar": "2026-09-11T16:00:00+00:00",
                 "last_bars": {
                     "BTC/USD": "2026-09-11T16:00:00+00:00",
@@ -91,14 +118,58 @@ def test_read_positions_book() -> None:
     assert state["open_count"] == 2
     assert state["max_open_positions"] == 2
     assert state["position"]["entry_price"] == 77000
+    assert state["starting_equity"] == 500.0
+    assert abs(state["pnl"] or 0) < 1e-9
+    assert abs(state["pnl_pct"] or 0) < 1e-9
     print("    book cards BTC LONG / ETH FLAT / SOL SHORT")
+
+
+def test_live_start_equity_return_math() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="gemini-dash-"))
+    state_path = tmp / "runner.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "equity": 500.0,
+                "start_equity": 500.0,
+                "circuit_breaker": {"loss_streak": 0, "tripped": False, "cooldown_bars": 0},
+                "positions": {
+                    "BTC/USD": {"status": "FLAT"},
+                    "ETH/USD": {"status": "FLAT"},
+                    "SOL/USD": {"status": "FLAT"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    import core.dashboard as dash
+
+    original_paths = dash._paths
+    original_paper = dash.is_paper_trading
+    dash._paths = lambda: {"state": state_path, "trades": tmp / "live_trades.csv", "rejects": tmp / "r.csv"}
+    dash.is_paper_trading = lambda: False
+    try:
+        state = read_runner_state()
+    finally:
+        dash._paths = original_paths
+        dash.is_paper_trading = original_paper
+
+    assert state["desk_title"] == "Live Execution Desk"
+    assert state["equity_label"] == "LIVE KRAKEN EQUITY"
+    assert state["live_badge"] == "● LIVE KRAKEN (USD)"
+    assert state["starting_equity"] == 500.0
+    assert state["pnl"] == 0.0
+    assert state["pnl_pct"] == 0.0
+    print("    live equity +0.00 vs 500 start")
 
 
 def main() -> int:
     checks = [
         ("page surfaces", test_page_has_multi_pair_surfaces),
+        ("desk labels", test_desk_labels_toggle),
         ("trade symbol", test_enrich_trade_keeps_symbol),
         ("position book", test_read_positions_book),
+        ("live return math", test_live_start_equity_return_math),
     ]
     failures = 0
     for label, check in checks:

@@ -198,7 +198,7 @@ def runner_for(
         exchange_id="kraken",
         min_confidence=0.6,
         starting_equity=10_000.0,
-        trade_log=tmp / "paper_trades.csv",
+        trade_log=kwargs.pop("trade_log", tmp / "paper_trades.csv"),
         reject_log=tmp / "rejected_alerts.csv",
         state_path=tmp / "runner.json",
         pairs=kwargs.pop("pairs", ("BTC/USD",)),
@@ -697,6 +697,7 @@ def test_live_syncs_balance_and_posts_limit() -> None:
         },
     )
     assert runner.state.equity == 200.0
+    assert runner.state.start_equity == 200.0
     report = runner.cycle(now=NOW)
     assert report.position == "LONG"
     assert orders and orders[0][0] == "limit"
@@ -705,6 +706,34 @@ def test_live_syncs_balance_and_posts_limit() -> None:
     expected = truncate_qty(200.0 * 0.48 / 10000.0, 8)
     assert abs(runner.state.positions["BTC/USD"]["size"] - expected) < 1e-12
     print("    live balance sync + post-only limit")
+
+
+def test_live_anchors_start_equity_and_trade_log_name() -> None:
+    from core.dashboard import _trade_log_name
+
+    assert _trade_log_name(paper=True) == "paper_trades.csv"
+    assert _trade_log_name(paper=False) == "live_trades.csv"
+
+    tmp = tmpdir()
+    agent = StubAgent("HOLD", 0.0)
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        agent,
+        tmp,
+        paper_trading=False,
+        balance_fn=lambda: 500.0,
+        order_fn=lambda *args: None,
+        trade_log=tmp / "live_trades.csv",
+        pair_limits={"BTC/USD": PairLimits("BTC/USD", 0.0, 8, 1)},
+    )
+    assert runner.trade_log.name == "live_trades.csv"
+    assert runner.state.equity == 500.0
+    assert runner.state.start_equity == 500.0
+    saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
+    assert saved["start_equity"] == 500.0
+    assert saved["circuit_breaker"]["cooldown_bars"] == 0
+    print("    live start_equity + live_trades.csv")
 
 
 def test_paper_does_not_place_exchange_orders() -> None:
@@ -860,6 +889,7 @@ def main() -> int:
         ("order size clamp", test_order_size_truncates_and_clamps),
         ("below ordermin skip", test_below_ordermin_skips_entry),
         ("live sync + post-only", test_live_syncs_balance_and_posts_limit),
+        ("live start_equity + trade log", test_live_anchors_start_equity_and_trade_log_name),
         ("paper places no order", test_paper_does_not_place_exchange_orders),
         ("restart recovery", test_restart_resumes_open_position_without_duplicate_entry),
         ("live missing keys fail closed", test_live_missing_keys_fails_closed_on_startup),

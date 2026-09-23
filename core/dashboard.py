@@ -1,8 +1,8 @@
-"""Read-only dashboard for the paper-trading runner.
+"""Read-only dashboard for the paper / live Kraken runner.
 
 Serves a single Tailwind page on 0.0.0.0:8050 and a JSON snapshot the browser
 polls every 10 seconds. File reads are short-lived and shared, so this process
-never locks `state/runner.json` or `data/paper_trades.csv` away from the runner.
+never locks `state/runner.json` or the trade CSV away from the runner.
 
     python -m core.dashboard
 """
@@ -32,6 +32,7 @@ from fastapi.responses import HTMLResponse
 from core.config import (
     MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
+    PAPER_TRADING,
     PROJECT_ROOT,
     TRADING_PAIRS,
     TRIGGER_TIMEFRAME,
@@ -79,6 +80,33 @@ def _cfg():
         return None
 
 
+def is_paper_trading() -> bool:
+    cfg = _cfg()
+    if cfg is not None:
+        return bool(cfg.paper_trading)
+    return bool(PAPER_TRADING)
+
+
+def desk_labels(*, paper: bool | None = None) -> dict[str, Any]:
+    """Header / equity-card copy for paper vs live Kraken mode."""
+    paper_mode = is_paper_trading() if paper is None else bool(paper)
+    if paper_mode:
+        return {
+            "paper_trading": True,
+            "desk_title": "Paper desk",
+            "equity_label": "PAPER EQUITY",
+            "live_badge": None,
+            "trade_log_empty": "No paper trades yet",
+        }
+    return {
+        "paper_trading": False,
+        "desk_title": "Live Execution Desk",
+        "equity_label": "LIVE KRAKEN EQUITY",
+        "live_badge": "● LIVE KRAKEN (USD)",
+        "trade_log_empty": "No live trades yet",
+    }
+
+
 def dashboard_secret() -> str:
     cfg = _cfg()
     if cfg is None:
@@ -109,17 +137,23 @@ def check_token(request: Request, token: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid or missing token")
 
 
+def _trade_log_name(*, paper: bool | None = None) -> str:
+    paper_mode = is_paper_trading() if paper is None else bool(paper)
+    return "paper_trades.csv" if paper_mode else "live_trades.csv"
+
+
 def _paths() -> dict[str, Path]:
     cfg = _cfg()
+    trade_name = _trade_log_name()
     if cfg is not None:
         return {
             "state": cfg.paths["root"] / "state" / "runner.json",
-            "trades": cfg.paths["data"] / "paper_trades.csv",
+            "trades": cfg.paths["data"] / trade_name,
             "rejects": cfg.paths["data"] / "rejected_alerts.csv",
         }
     return {
         "state": PROJECT_ROOT / "state" / "runner.json",
-        "trades": PROJECT_ROOT / "data" / "paper_trades.csv",
+        "trades": PROJECT_ROOT / "data" / trade_name,
         "rejects": PROJECT_ROOT / "data" / "rejected_alerts.csv",
     }
 
@@ -168,8 +202,30 @@ def _position_cards(
     return cards
 
 
+def _resolve_start_equity(raw: dict[str, Any], equity_f: float | None, paper: bool) -> float | None:
+    """Prefer persisted live deposit baseline over PAPER_STARTING_BALANCE."""
+    if raw.get("start_equity") is not None:
+        try:
+            return float(raw["start_equity"])
+        except (TypeError, ValueError):
+            pass
+    history = raw.get("equity_history")
+    if isinstance(history, list) and history:
+        try:
+            return float(history[0])
+        except (TypeError, ValueError):
+            pass
+    if not paper and equity_f is not None:
+        return equity_f
+    cfg = _cfg()
+    if cfg is not None:
+        return float(cfg.paper_starting_balance)
+    return 10_000.0
+
+
 def _empty_state(*, error: str | None = None) -> dict[str, Any]:
     pairs = _pairs()
+    labels = desk_labels()
     empty: dict[str, Any] = {
         "exists": False,
         "equity": None,
@@ -186,6 +242,7 @@ def _empty_state(*, error: str | None = None) -> dict[str, Any]:
         "positions": _position_cards({}, {}, pairs),
         "open_count": 0,
         "max_open_positions": _max_open(),
+        **labels,
     }
     if error:
         empty["error"] = error
@@ -194,6 +251,7 @@ def _empty_state(*, error: str | None = None) -> dict[str, Any]:
 
 def read_runner_state() -> dict[str, Any]:
     path = _paths()["state"]
+    labels = desk_labels()
     if not path.exists():
         return _empty_state()
     try:
@@ -202,14 +260,17 @@ def read_runner_state() -> dict[str, Any]:
         log.warning("state unreadable: %s", exc)
         return _empty_state(error=str(exc))
 
-    cfg = _cfg()
-    starting = float(cfg.paper_starting_balance) if cfg is not None else 10_000.0
     equity = raw.get("equity")
     try:
         equity_f = float(equity) if equity is not None else None
     except (TypeError, ValueError):
         equity_f = None
-    pnl = None if equity_f is None else equity_f - starting
+    starting = _resolve_start_equity(
+        raw if isinstance(raw, dict) else {},
+        equity_f,
+        labels["paper_trading"],
+    )
+    pnl = None if equity_f is None or starting is None else equity_f - starting
 
     pairs = _pairs()
     book = migrate_position_book(raw if isinstance(raw, dict) else {}, pairs)
@@ -224,10 +285,10 @@ def read_runner_state() -> dict[str, Any]:
         "equity": equity_f,
         "starting_equity": starting,
         "pnl": pnl,
-        "pnl_pct": None if pnl is None or starting == 0 else (pnl / starting) * 100.0,
+        "pnl_pct": None if pnl is None or not starting else (pnl / starting) * 100.0,
         "loss_streak": int(breaker["loss_streak"]),
         "breaker_active": bool(breaker["tripped"]),
-        "breaker_bars": int(raw.get("breaker_bars") or 0),
+        "breaker_bars": int(breaker.get("cooldown_bars") or raw.get("breaker_bars") or 0),
         "last_bar": raw.get("last_bar"),
         "last_bars": last_bars,
         "position_side": side,
@@ -235,6 +296,7 @@ def read_runner_state() -> dict[str, Any]:
         "positions": cards,
         "open_count": sum(1 for card in cards if card["status"] != "FLAT"),
         "max_open_positions": _max_open(),
+        **labels,
     }
 
 
@@ -478,7 +540,10 @@ PAGE = r"""<!DOCTYPE html>
     <header class="flex flex-wrap items-end justify-between gap-3 mb-6">
       <div>
         <p class="text-xs uppercase tracking-[0.2em] text-teal-400/80">Gemini Trend Guard</p>
-        <h1 class="text-2xl font-semibold text-white">Paper desk</h1>
+        <div class="flex flex-wrap items-center gap-3 mt-1">
+          <h1 id="desk-title" class="text-2xl font-semibold text-white">Paper desk</h1>
+          <span id="live-badge" class="hidden inline-flex items-center gap-1.5 text-xs font-medium text-emerald-300 bg-emerald-500/10 ring-1 ring-emerald-500/30 px-2.5 py-1 rounded-md">● LIVE KRAKEN (USD)</span>
+        </div>
         <p class="text-sm text-slate-400">Read-only monitor · does not lock the runner</p>
       </div>
       <div class="text-right text-sm text-slate-400">
@@ -492,7 +557,7 @@ PAGE = r"""<!DOCTYPE html>
 
     <section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
       <article class="bg-panel rounded-xl border border-white/5 p-4">
-        <p class="text-xs uppercase tracking-wider text-slate-400">Paper equity</p>
+        <p id="equity-label" class="text-xs uppercase tracking-wider text-slate-400">PAPER EQUITY</p>
         <p id="equity" class="text-3xl font-semibold mt-1 mono">—</p>
         <p id="pnl" class="text-sm mt-2">—</p>
       </article>
@@ -598,13 +663,23 @@ PAGE = r"""<!DOCTYPE html>
         </article>`;
       }).join("") || `<article class="bg-panel rounded-xl border border-white/5 p-4 md:col-span-3"><p class="text-sm text-slate-500">No position book</p></article>`;
 
+      document.getElementById("desk-title").textContent = s.desk_title || (s.paper_trading === false ? "Live Execution Desk" : "Paper desk");
+      const badgeEl = document.getElementById("live-badge");
+      if (s.live_badge) {
+        badgeEl.textContent = s.live_badge;
+        badgeEl.classList.remove("hidden");
+      } else {
+        badgeEl.classList.add("hidden");
+      }
+      document.getElementById("equity-label").textContent = s.equity_label || (s.paper_trading === false ? "LIVE KRAKEN EQUITY" : "PAPER EQUITY");
+
       document.getElementById("equity").textContent = s.equity == null ? "—" : fmt(s.equity, 2);
       const pnl = s.pnl;
       const pnlEl = document.getElementById("pnl");
       if (pnl == null) { pnlEl.textContent = "Starting balance unknown"; pnlEl.className = "text-sm mt-2 text-slate-400"; }
       else {
         const sign = pnl >= 0 ? "+" : "";
-        pnlEl.textContent = `${sign}${fmt(pnl, 2)}  (${sign}${fmt(s.pnl_pct, 2)}%) vs ${fmt(s.starting_equity, 0)} start`;
+        pnlEl.textContent = `${sign}${fmt(pnl, 2)}  (${sign}${fmt(s.pnl_pct, 2)}%) vs ${fmt(s.starting_equity, 2)} start`;
         pnlEl.className = "text-sm mt-2 " + (pnl >= 0 ? "text-teal-300" : "text-rose-300");
       }
 
@@ -651,7 +726,7 @@ PAGE = r"""<!DOCTYPE html>
       document.getElementById("trade-meta").textContent =
         `${data.trades && data.trades.count || 0} fills · ${data.rejects || 0} rejects · showing ${rows.length}`;
       if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">No paper trades yet</td></tr>`;
+        body.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">${s.trade_log_empty || "No trades yet"}</td></tr>`;
       } else {
         body.innerHTML = rows.map(t => {
           const verdictTone = t.verdict === "REJECTED" || t.hit === "stop" ? "red" : (t.tone || "slate");

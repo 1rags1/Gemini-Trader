@@ -141,6 +141,8 @@ class RunnerState:
     loss_streak: int = 0
     breaker_active: bool = False
     breaker_bars: int = 0
+    #: Deposit / paper baseline used for dashboard return %. Set on first live sync.
+    start_equity: float | None = None
     last_bar: str | None = None
     #: Per-symbol book. Each value is at least {"status": "FLAT"|"LONG"|"SHORT"}.
     positions: dict[str, dict[str, Any]] = field(default_factory=empty_position_book)
@@ -661,14 +663,22 @@ class StrategyRunner:
             else self.settings.paper_starting_balance
         )
         data_dir = self.settings.paths["data"] if trade_log is None else trade_log.parent
-        self.trade_log = trade_log or (data_dir / "paper_trades.csv")
+        default_log = "paper_trades.csv" if self.paper_trading else "live_trades.csv"
+        self.trade_log = trade_log or (data_dir / default_log)
         self.reject_log = reject_log or (data_dir / "rejected_alerts.csv")
         self.state_path = state_path or (self.settings.paths["root"] / "state" / "runner.json")
         self.balance_fn = balance_fn
         self.order_fn = order_fn
         self.pair_limits = pair_limits if pair_limits is not None else self._load_pair_limits(pairs is None)
         self.state = self._load_state()
-        if not self.paper_trading:
+        if self.paper_trading:
+            if self.state.start_equity is None:
+                self.state.start_equity = float(self.starting_equity)
+            else:
+                self.starting_equity = float(self.state.start_equity)
+        else:
+            if self.state.start_equity is not None:
+                self.starting_equity = float(self.state.start_equity)
             self.sync_account_balance()
 
     @property
@@ -722,7 +732,24 @@ class StrategyRunner:
                 self.settings.exchange_api_secret,
             )
         prior = self.state.equity
+        paper_baseline = float(self.settings.paper_starting_balance)
+        prior_start = self.state.start_equity
+        migrating_from_paper = (
+            prior_start is not None
+            and float(prior_start) >= paper_baseline * 0.99
+            and live + 1e-9 < float(prior_start) * 0.5
+        )
         self.state.equity = live
+        if prior_start is None or migrating_from_paper:
+            # Anchor returns to the live deposit, not the old paper 10k book.
+            self.state.start_equity = live
+            self.starting_equity = live
+            self.state.equity_history = [live]
+            self.state.loss_streak = 0
+            self.state.breaker_active = False
+            self.state.breaker_bars = 0
+            log.info("live start_equity baseline set to %.4f", live)
+            self.save_state()
         log.info("live USD/ZUSD balance %.4f (runner.json equity was %.4f)", live, prior)
         if live <= 0:
             log.warning("live USD/ZUSD free balance is 0; new entries will be skipped")
@@ -819,13 +846,22 @@ class StrategyRunner:
                 equity_history=list(raw.get("equity_history") or []),
                 loss_streak=int(breaker["loss_streak"]),
                 breaker_active=bool(breaker["tripped"]),
-                breaker_bars=int(raw.get("breaker_bars") or 0),
+                breaker_bars=int(breaker.get("cooldown_bars") or raw.get("breaker_bars") or 0),
+                start_equity=(
+                    float(raw["start_equity"])
+                    if raw.get("start_equity") is not None
+                    else None
+                ),
                 last_bar=raw.get("last_bar"),
                 last_bars=last_bars,
                 positions=positions,
                 position=legacy_open_slot(positions),
             )
-        return RunnerState(equity=self.starting_equity, positions=empty_position_book(pairs))
+        return RunnerState(
+            equity=self.starting_equity,
+            start_equity=float(self.starting_equity),
+            positions=empty_position_book(pairs),
+        )
 
     def save_state(self) -> None:
         if not self.state.positions:
@@ -838,11 +874,15 @@ class StrategyRunner:
             circuit_breaker={
                 "loss_streak": self.state.loss_streak,
                 "tripped": self.state.breaker_active,
+                "cooldown_bars": self.state.breaker_bars,
             },
             equity_history=self.state.equity_history,
             last_bar=self.state.last_bar,
             last_bars=self.state.last_bars,
             breaker_bars=self.state.breaker_bars,
+            start_equity=self.state.start_equity
+            if self.state.start_equity is not None
+            else self.starting_equity,
             pairs=self.pairs,
         )
         tmp = self.state_path.with_suffix(".tmp")

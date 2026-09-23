@@ -137,7 +137,7 @@ class Settings:
 
 
 def empty_circuit_breaker() -> dict[str, Any]:
-    return {"loss_streak": 0, "tripped": False}
+    return {"loss_streak": 0, "tripped": False, "cooldown_bars": 0}
 
 
 def empty_position_slot(macro_regime: str = "UNKNOWN") -> dict[str, Any]:
@@ -221,10 +221,19 @@ def migrate_circuit_breaker(raw: dict[str, Any] | None) -> dict[str, Any]:
             tripped = nested.get("tripped")
         else:
             tripped = nested.get("active", raw.get("breaker_active", False))
-        return {"loss_streak": int(streak or 0), "tripped": bool(tripped)}
+        cooldown = nested.get(
+            "cooldown_bars",
+            nested.get("breaker_bars", raw.get("breaker_bars", 0)),
+        )
+        return {
+            "loss_streak": int(streak or 0),
+            "tripped": bool(tripped),
+            "cooldown_bars": int(cooldown or 0),
+        }
     return {
         "loss_streak": int(raw.get("loss_streak") or 0),
         "tripped": bool(raw.get("breaker_active") or raw.get("tripped") or False),
+        "cooldown_bars": int(raw.get("breaker_bars") or raw.get("cooldown_bars") or 0),
     }
 
 
@@ -256,6 +265,7 @@ def dump_runner_state(
     last_bar: str | None = None,
     last_bars: dict[str, str] | None = None,
     breaker_bars: int = 0,
+    start_equity: float | None = None,
     pairs: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Serialize runner state in the MTF schema.
@@ -267,19 +277,21 @@ def dump_runner_state(
     book = empty_position_book(pairs)
     for symbol, slot in (positions or {}).items():
         book[symbol] = canonical_position_slot(slot)
+    breaker = migrate_circuit_breaker(circuit_breaker)
+    breaker["cooldown_bars"] = int(breaker_bars)
     payload: dict[str, Any] = {
         "equity": float(equity),
-        "circuit_breaker": migrate_circuit_breaker(circuit_breaker),
+        "circuit_breaker": breaker,
         "positions": book,
     }
+    if start_equity is not None:
+        payload["start_equity"] = float(start_equity)
     if equity_history is not None:
         payload["equity_history"] = list(equity_history)
     if last_bar is not None:
         payload["last_bar"] = last_bar
     if last_bars is not None:
         payload["last_bars"] = dict(last_bars)
-    if breaker_bars:
-        payload["breaker_bars"] = int(breaker_bars)
     return payload
 
 
