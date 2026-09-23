@@ -35,7 +35,7 @@ def test_page_has_multi_pair_surfaces() -> None:
     assert ">EMA 9</th>" in PAGE
     assert ">EMA 21</th>" in PAGE
     assert ">15m ATR</th>" in PAGE
-    assert DASHBOARD_HOST == "0.0.0.0"
+    assert DASHBOARD_HOST == "127.0.0.1"
     assert DASHBOARD_PORT == 8050
     print("    page + bind defaults")
 
@@ -163,6 +163,77 @@ def test_live_start_equity_return_math() -> None:
     print("    live equity +0.00 vs 500 start")
 
 
+def test_dashboard_bind_requires_secret_off_localhost() -> None:
+    import os
+
+    from fastapi import HTTPException
+
+    from core.config import get_settings
+    from core.dashboard import check_token
+    from core.exposure import assert_secret_for_public_bind
+
+    assert_secret_for_public_bind(
+        host="127.0.0.1",
+        secret="",
+        service="the dashboard",
+        secret_name="DASHBOARD_SECRET",
+    )
+    try:
+        assert_secret_for_public_bind(
+            host="0.0.0.0",
+            secret="",
+            service="the dashboard",
+            secret_name="DASHBOARD_SECRET",
+        )
+    except RuntimeError as exc:
+        assert "DASHBOARD_SECRET" in str(exc)
+    else:
+        raise AssertionError("public dashboard bind must fail closed")
+    assert_secret_for_public_bind(
+        host="0.0.0.0",
+        secret="dash",
+        service="the dashboard",
+        secret_name="DASHBOARD_SECRET",
+    )
+
+    class Req:
+        def __init__(self, host: str, headers: dict | None = None) -> None:
+            self.client = type("C", (), {"host": host})()
+            self.headers = headers or {}
+
+    os.environ["DASHBOARD_SECRET"] = ""
+    os.environ["WEBHOOK_SECRET"] = ""
+    get_settings.cache_clear()
+    try:
+        check_token(Req("127.0.0.1"), None)
+        try:
+            check_token(Req("203.0.113.10"), None)
+            raise AssertionError("remote dashboard request should be rejected")
+        except HTTPException as exc:
+            assert exc.status_code == 401
+            assert "DASHBOARD_SECRET" in exc.detail
+        try:
+            check_token(Req("127.0.0.1", {"cf-ray": "1"}), None)
+            raise AssertionError("tunneled dashboard request should be rejected")
+        except HTTPException as exc:
+            assert exc.status_code == 401
+
+        os.environ["DASHBOARD_SECRET"] = "dash-secret"
+        get_settings.cache_clear()
+        check_token(Req("127.0.0.1"), None)
+        try:
+            check_token(Req("203.0.113.10"), "nope")
+            raise AssertionError("bad token should be rejected")
+        except HTTPException as exc:
+            assert exc.status_code == 401
+        check_token(Req("203.0.113.10"), "dash-secret")
+        print("    dashboard localhost open; public bind and tunnel need a secret")
+    finally:
+        os.environ.pop("DASHBOARD_SECRET", None)
+        os.environ.pop("WEBHOOK_SECRET", None)
+        get_settings.cache_clear()
+
+
 def main() -> int:
     checks = [
         ("page surfaces", test_page_has_multi_pair_surfaces),
@@ -170,6 +241,7 @@ def main() -> int:
         ("trade symbol", test_enrich_trade_keeps_symbol),
         ("position book", test_read_positions_book),
         ("live return math", test_live_start_equity_return_math),
+        ("bind requires secret", test_dashboard_bind_requires_secret_off_localhost),
     ]
     failures = 0
     for label, check in checks:
