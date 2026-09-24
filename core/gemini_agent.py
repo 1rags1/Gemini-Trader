@@ -48,16 +48,24 @@ Risk rules:
   (~1:2.33). Keep that ratio. The 1h regime block overrides the 15m trigger.
 - For HOLD, stop_loss and take_profit are null.
 
+Veto rules. You are a coach, not a cheerleader:
+- Marginal, late, choppy, or only-partly-aligned setups must be REJECT.
+- A high confidence number is not a confirm. Prefer REJECT over a weak BUY or SELL.
+- BUY or SELL only when the 1h regime and the 15m trigger agree and the setup is clean.
+- REJECT and HOLD both mean "do not open a trade". Skipping is better than a thin edge.
+- When indicators conflict, return REJECT, not a hopeful confirm.
+
 Output rules:
 - Never invent data that is not in the snapshot.
-- confidence is 0.0-1.0 and must reflect genuine signal strength; when
-  indicators conflict, return HOLD with low confidence.
+- confidence is 0.0-1.0 and must reflect genuine signal strength.
 - rationale is at most two sentences and must cite the regime when it forces
   the decision.
 
 Hard risk limits are enforced in code, not by this response. You cannot
 override position size, the circuit breaker, the altcoin correlation cap,
-spot long-only, or post-only entries. Return only the JSON decision."""
+spot long-only, post-only entries, or the stop and target the strategy already
+computed. If you return stop_loss or take_profit, the runner ignores them.
+Return only the JSON decision."""
 
 PAPER_MODE_NOTE = (
     "Operating mode: paper trading. Entries and exits are simulated locally "
@@ -89,7 +97,7 @@ BASE_BACKOFF = 1.5
 DECISION_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
     "properties": {
-        "action": {"type": "STRING", "enum": ["BUY", "SELL", "HOLD"]},
+        "action": {"type": "STRING", "enum": ["BUY", "SELL", "HOLD", "REJECT"]},
         "confidence": {"type": "NUMBER"},
         "stop_loss": {"type": "NUMBER", "nullable": True},
         "take_profit": {"type": "NUMBER", "nullable": True},

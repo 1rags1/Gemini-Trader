@@ -156,17 +156,17 @@ def test_dump_canonical_state() -> None:
 
 
 def test_on_disk_runner_json() -> None:
+    """Local runtime state is optional. When present, it must not hold secrets."""
     path = PROJECT_ROOT / "state" / "runner.json"
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not path.exists():
+        print("    no local state/runner.json (runtime state stays gitignored)")
+        return
+    text = path.read_text(encoding="utf-8")
+    assert "GEMINI_API_KEY" not in text
+    assert "EXCHANGE_API_SECRET" not in text
+    raw = json.loads(text)
     assert "circuit_breaker" in raw
-    assert raw["circuit_breaker"] == {
-        "loss_streak": 0,
-        "tripped": False,
-        "cooldown_bars": 0,
-    }
-    assert raw.get("start_equity") == 500.0
-    assert raw.get("equity") == 500.0
-    assert set(raw["positions"]) == set(TRADING_PAIRS)
+    assert isinstance(raw.get("positions"), dict)
     for symbol, slot in raw["positions"].items():
         canonical = canonical_position_slot(slot)
         assert set(canonical) == {

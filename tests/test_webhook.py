@@ -112,7 +112,7 @@ def test_entry_alert_is_reviewed(client) -> None:
         assert body["stop_loss"] is None and body["take_profit"] is None
         return
 
-    assert body["agent_action"] in {"BUY", "SELL", "HOLD"}
+    assert body["agent_action"] in {"BUY", "SELL", "HOLD", "REJECT"}
     assert 0.0 <= body["confidence"] <= 1.0
     assert body["rationale"]
     print(f"    agent={body['agent_action']} confidence={body['confidence']} model={body['model']}")

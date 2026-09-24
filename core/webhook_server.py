@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from core.config import get_settings
 from core.exposure import assert_secret_for_public_bind, request_from_localhost
 from core.gemini_agent import GeminiAgent
+from core.trade_log import append_row as write_trade_row
 from core.market_data import add_indicators, fetch_ohlcv, latest_snapshot
 from core.net import enable_os_trust_store
 from strategies import list_strategies, load_strategy
@@ -50,13 +51,6 @@ TRADINGVIEW_INTERVALS = {
     "45": "45m", "60": "1h", "120": "2h", "180": "3h", "240": "4h",
     "D": "1d", "1D": "1d", "W": "1w", "1W": "1w", "M": "1M", "1M": "1M",
 }
-
-TRADE_LOG_FIELDS = [
-    "timestamp", "symbol", "action", "entry_price", "stop_loss", "take_profit",
-    "verdict", "confidence", "agent_action", "model", "alert_reason",
-    "adx", "macro_ema", "loss_streak", "rationale",
-]
-
 
 class TradingViewAlert(BaseModel):
     """The JSON emitted by the Pine strategy's alert_message.
@@ -142,15 +136,9 @@ def reject_log_path() -> Path:
 
 
 def append_row(path: Path, row: dict[str, Any]) -> None:
-    """Append one row, writing the header when the file is new."""
+    """Append one row. CLOSE rows keep the fill in exit_price, not entry_price."""
     with _csv_lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        is_new = not path.exists() or path.stat().st_size == 0
-        with path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=TRADE_LOG_FIELDS)
-            if is_new:
-                writer.writeheader()
-            writer.writerow({key: row.get(key, "") for key in TRADE_LOG_FIELDS})
+        write_trade_row(path, row)
 
 
 def build_snapshot(alert: TradingViewAlert) -> dict[str, Any]:
@@ -223,13 +211,15 @@ def evaluate(alert: TradingViewAlert) -> ExecutionResult:
         "timestamp": now,
         "symbol": symbol,
         "action": alert.action,
-        "entry_price": alert.price,
+        "entry_price": "" if alert.action == "CLOSE" else alert.price,
+        "exit_price": alert.price if alert.action == "CLOSE" else "",
         "stop_loss": alert.stop,
         "take_profit": alert.target,
         "alert_reason": alert.reason,
         "adx": alert.adx,
         "macro_ema": alert.macro_ema,
         "loss_streak": alert.loss_streak,
+        "source": "webhook",
     }
 
     # An exit is risk-reducing, so it is never put to a vote. Letting the model

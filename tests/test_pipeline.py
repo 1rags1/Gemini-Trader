@@ -83,7 +83,7 @@ def test_agent_returns_valid_decision() -> None:
     strategy = load_strategy(list_strategies()[0])
     decision = GeminiAgent().decide(build_snapshot(), strategy.prompt_context())
 
-    assert decision.action in {"BUY", "SELL", "HOLD"}
+    assert decision.action in {"BUY", "SELL", "HOLD", "REJECT"}
     assert 0.0 <= decision.confidence <= 1.0
     assert decision.rationale
     print(f"\n{decision}")

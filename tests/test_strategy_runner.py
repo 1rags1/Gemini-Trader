@@ -456,6 +456,12 @@ def test_open_position_closes_on_stop() -> None:
     assert report.position == "FLAT"
     rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
     assert rows[-1]["action"] == "CLOSE"
+    assert float(rows[-1]["entry_price"]) == 10000
+    assert float(rows[-1]["exit_price"]) != float(rows[-1]["entry_price"])
+    assert float(rows[-1]["stop_loss"]) != float(rows[-1]["entry_price"])
+    assert rows[-1]["hit"] == "stop"
+    assert float(rows[-1]["pnl"]) < 0
+    assert runner.state.equity < 10_000
     print(f"    closed via stop, equity={runner.state.equity:.2f}")
 
 

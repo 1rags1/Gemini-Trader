@@ -276,6 +276,7 @@ def dump_runner_state(
     pairs: tuple[str, ...] | None = None,
     pending_orders: dict[str, dict] | None = None,
     book_name: str | None = None,
+    book_reset_at: str | None = None,
 ) -> dict[str, Any]:
     """Serialize runner state in the MTF schema.
 
@@ -284,8 +285,12 @@ def dump_runner_state(
     """
     pairs = pairs or TRADING_PAIRS
     book = empty_position_book(pairs)
-    for symbol, slot in (positions or {}).items():
-        book[symbol] = canonical_position_slot(slot)
+    # Only the official pair list is persisted. Alias keys (ETH/USDT) must not
+    # survive a save and become a second book the scanner never manages.
+    for symbol in pairs:
+        slot = (positions or {}).get(symbol)
+        if isinstance(slot, dict):
+            book[symbol] = canonical_position_slot(slot)
     breaker = migrate_circuit_breaker(circuit_breaker)
     breaker["cooldown_bars"] = int(breaker_bars)
     payload: dict[str, Any] = {
@@ -309,6 +314,8 @@ def dump_runner_state(
         }
     if book_name in {"paper", "live"}:
         payload["book"] = book_name
+    if book_reset_at:
+        payload["book_reset_at"] = book_reset_at
     return payload
 
 
