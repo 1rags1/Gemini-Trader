@@ -341,14 +341,24 @@ def test_dashboard_bind_requires_secret_off_localhost() -> None:
 
         os.environ["DASHBOARD_SECRET"] = "dash-secret"
         get_settings.cache_clear()
-        check_token(Req("127.0.0.1"), None)
+        try:
+            check_token(Req("127.0.0.1"), None)
+            raise AssertionError("a configured secret must lock localhost too")
+        except HTTPException as exc:
+            assert exc.status_code == 401
+            assert exc.detail == "invalid or missing token"
+            assert "dash-secret" not in str(exc.detail)
+        check_token(Req("127.0.0.1"), "dash-secret")
+        check_token(Req("127.0.0.1", {"X-Dashboard-Token": "dash-secret"}), None)
+        check_token(Req("127.0.0.1", {"Authorization": "Bearer dash-secret"}), None)
         try:
             check_token(Req("203.0.113.10"), "nope")
             raise AssertionError("bad token should be rejected")
-        except HTTPException as exc:
-            assert exc.status_code == 401
+        except HTTPException as excl:
+            assert excl.status_code == 401
+            assert "dash-secret" not in str(excl.detail)
         check_token(Req("203.0.113.10"), "dash-secret")
-        print("    dashboard localhost open; public bind and tunnel need a secret")
+        print("    secret locks every client; public bind still fails closed")
     finally:
         os.environ.pop("DASHBOARD_SECRET", None)
         os.environ.pop("WEBHOOK_SECRET", None)

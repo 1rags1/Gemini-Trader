@@ -68,7 +68,15 @@ python -m core.dashboard
 
 Open `http://127.0.0.1:8050`. The page shows two books at once. **PRACTICE / PAPER** is fake money and starts at `PAPER_STARTING_BALANCE` (default $10,000). **LIVE / KRAKEN** is the real Kraken USD balance. With the default flags the banner says **ACTIVE: PAPER TRADING**, the practice panel is marked in use, and the Kraken panel stays idle even if a last-known balance is on disk. The dashboard never sends an order.
 
-To listen on another interface, set `DASHBOARD_SECRET` (or `WEBHOOK_SECRET`) and start with `--host 0.0.0.0` or `DASHBOARD_HOST`. Without that secret the process refuses a public bind. A Cloudflare tunnel also requires the secret, including when the bind itself is localhost.
+The default bind is `127.0.0.1`. On a VPS, keep that bind and open it with an SSH tunnel:
+
+```bash
+ssh -L 8050:127.0.0.1:8050 user@your-vps
+```
+
+Then browse `http://127.0.0.1:8050` on your own machine. A firewall rule that blocks port 8050 from the internet does the same job if you already bound localhost.
+
+To listen on another interface, set `DASHBOARD_SECRET` (or `WEBHOOK_SECRET`) and start with `--host 0.0.0.0` or `DASHBOARD_HOST`. Without that secret the process refuses a public bind. A Cloudflare tunnel also requires the secret, including when the bind itself is localhost. When the secret is set, every HTML and `/api/snapshot` request must send it as `?token=`, the `X-Dashboard-Token` header, or `Authorization: Bearer`. Responses never include the secret.
 
 TradingView webhook (paper log only):
 
@@ -84,6 +92,37 @@ On Windows, `run_bot.ps1` starts that webhook and a Cloudflare quick tunnel, and
 .\run_bot.ps1
 .\run_bot.ps1 -Stop
 ```
+
+## What to run all day
+
+The 24/7 path is the VPS process `python -m core.strategy_runner` plus `python -m core.dashboard`. The runner scans Kraken and, in paper mode, updates the fake book. The dashboard only reads that book.
+
+`python -m core.webhook_server` is a log. It reviews a TradingView alert and appends a CSV. It does not send an exchange order and it does not change runner equity.
+
+A short daily note is:
+
+```bash
+python -m core.practice_summary
+python -m core.practice_summary --write
+```
+
+`--write` saves the same text under `state/practice_notes/`. That folder is runtime state. See `PRACTICE_NOTES.md`.
+
+## One USD book
+
+The runner trades Kraken USD pairs only: `BTC/USD`, `ETH/USD`, and `SOL/USD`. That is the OHLCV market. `ETH/USDT`, `BTC/USDC`, `XBT/USD`, and `ZUSD` are aliases, not a second position. On startup in paper mode, an open alias is moved onto the matching USD symbol when that slot is flat, so a leftover USDT long cannot sit beside a USD flat. A conflicting alias is removed from the book and copied to `state/quarantine_positions.json`. Live mode does not retarget a different quote, because that would sell the wrong pair.
+
+## Reset the paper book to $10,000
+
+New paper state starts at `PAPER_STARTING_BALANCE` (default `10000`). Equity moves when a paper position closes, so the dashboard number matches closed-trade P&L. If a saved paper book is still stuck on its start balance while the CSV has runner P&L, the next paper start adds that P&L once.
+
+To archive the current paper state and start over at the configured balance:
+
+```bash
+python -m core.strategy_runner --reset-paper --once
+```
+
+`RESET_PAPER=true` does the same thing on the next start. Unset it afterward, or every restart wipes the paper book. The reset copies the old file to `state/archive/` and does not delete `live.json` or the live trade log. It refuses to run when paper mode is off.
 
 ## Which process can spend money
 

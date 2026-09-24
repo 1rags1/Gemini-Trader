@@ -2,7 +2,8 @@
 
 Serves a single Tailwind page on 127.0.0.1:8050 and a JSON snapshot the browser
 polls every 10 seconds. Binding another host requires DASHBOARD_SECRET (or
-WEBHOOK_SECRET). File reads are short-lived and shared, so this process never
+WEBHOOK_SECRET). When that secret is set, every page and snapshot request
+must present it. File reads are short-lived and shared, so this process never
 locks `state/runner.json` or the trade CSV away from the runner.
 
     python -m core.dashboard
@@ -44,6 +45,8 @@ from core.config import (
     migrate_circuit_breaker,
     migrate_position_book,
 )
+from core.symbols import reconcile_book
+from core.trade_log import upgrade_row
 from core.order_lifecycle import live_orders_permitted
 from core.market_data import (
     add_macro_indicators,
@@ -64,9 +67,6 @@ MACRO_CANDLES = 250
 TRIGGER_CANDLES = 100
 MARKET_FETCH_DELAY = 1.0
 
-_FILL_RE = re.compile(r"fill=([-\d.]+)")
-_ENTRY_RE = re.compile(r"entry=([-\d.]+)")
-_PNL_RE = re.compile(r"pnl=([-\d.]+)")
 _HIT_RE = re.compile(r"hit=(\w+)")
 
 _market_lock = threading.Lock()
@@ -153,21 +153,53 @@ def dashboard_secret() -> str:
     return (os.getenv("DASHBOARD_SECRET") or os.getenv("WEBHOOK_SECRET") or "").strip()
 
 
+def _header_value(headers: Any, name: str) -> str:
+    if headers is None or not hasattr(headers, "get"):
+        return ""
+    value = headers.get(name)
+    if value:
+        return str(value).strip()
+    value = headers.get(name.lower())
+    if value:
+        return str(value).strip()
+    return ""
+
+
+def presented_token(request: Request, token: str | None) -> str:
+    """Token from the query string, X-Dashboard-Token, or Authorization: Bearer."""
+    if token and str(token).strip():
+        return str(token).strip()
+    headers = getattr(request, "headers", None)
+    header = _header_value(headers, "X-Dashboard-Token")
+    if header:
+        return header
+    auth = _header_value(headers, "Authorization")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
 def check_token(request: Request, token: str | None) -> None:
-    """Localhost is open. A tunnel or any other peer needs a dashboard secret."""
+    """Require the dashboard secret whenever it is set, including on localhost.
+
+    With no secret, only a direct localhost client may read the page. A public
+    bind is refused at startup. The secret value is never copied into the response.
+    """
+    secret = dashboard_secret()
+    presented = presented_token(request, token)
+    if secret:
+        if not presented or not secrets.compare_digest(presented, secret):
+            raise HTTPException(status_code=401, detail="invalid or missing token")
+        return
     if request_from_localhost(request):
         return
-    secret = dashboard_secret()
-    if not secret:
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "DASHBOARD_SECRET or WEBHOOK_SECRET is required off localhost. "
-                "Set one before binding 0.0.0.0 or opening a tunnel."
-            ),
-        )
-    if not token or not secrets.compare_digest(token, secret):
-        raise HTTPException(status_code=401, detail="invalid or missing token")
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "DASHBOARD_SECRET or WEBHOOK_SECRET is required off localhost. "
+            "Set one before binding 0.0.0.0 or opening a tunnel."
+        ),
+    )
 
 
 def _trade_log_name(*, paper: bool | None = None) -> str:
@@ -315,7 +347,10 @@ def _book_metrics(raw: dict[str, Any] | None) -> dict[str, Any]:
         starting = _resolve_start_equity(raw, equity_f, True)
     pnl = None if equity_f is None or starting is None else equity_f - starting
     last_bars = dict(raw.get("last_bars") or {})
-    cards = _position_cards(migrate_position_book(raw, pairs), last_bars, pairs)
+    migrated = migrate_position_book(raw, pairs)
+    paperish = classify_book(raw, paper_starting_balance()) != "live"
+    book, _notes = reconcile_book(migrated, pairs, paper=paperish)
+    cards = _position_cards(book, last_bars, pairs)
     first_open = next((card["position"] for card in cards if card["position"] is not None), None)
     side = "FLAT" if first_open is None else str(first_open.get("side") or first_open.get("status") or "FLAT").upper()
     breaker = migrate_circuit_breaker(raw)
@@ -634,34 +669,36 @@ def _classify(row: dict[str, str]) -> str:
 
 
 def _enrich_trade(row: dict[str, str]) -> dict[str, Any]:
-    rationale = row.get("rationale") or ""
-    fill_m = _FILL_RE.search(rationale)
-    entry_m = _ENTRY_RE.search(rationale)
-    pnl_m = _PNL_RE.search(rationale)
+    upgraded = upgrade_row(row)
+    rationale = upgraded.get("rationale") or ""
     hit_m = _HIT_RE.search(rationale)
-    action = (row.get("action") or "").upper()
-    logged_price = _f(row.get("entry_price"))
-    entry = _f(entry_m.group(1)) if entry_m else (logged_price if action != "CLOSE" else None)
-    exit_price = _f(fill_m.group(1)) if fill_m else (logged_price if action == "CLOSE" else None)
+    action = (upgraded.get("action") or "").upper()
+    entry = _f(upgraded.get("entry_price"))
+    exit_price = _f(upgraded.get("exit_price"))
+    # A legacy CLOSE row stored the fill in entry_price and had no entry= tag.
+    if action == "CLOSE" and exit_price is None and entry is not None and "entry=" not in rationale:
+        exit_price = entry
+        entry = None
+    hit = upgraded.get("hit") or (hit_m.group(1) if hit_m else "")
     return {
-        "timestamp": row.get("timestamp") or "",
-        "symbol": row.get("symbol") or "",
+        "timestamp": upgraded.get("timestamp") or "",
+        "symbol": upgraded.get("symbol") or "",
         "action": action,
-        "verdict": (row.get("verdict") or "").upper(),
-        "tone": _classify(row),
+        "verdict": (upgraded.get("verdict") or "").upper(),
+        "tone": _classify(upgraded),
         "entry_price": entry,
         "exit_price": exit_price,
-        "stop_loss": _f(row.get("stop_loss")),
-        "take_profit": _f(row.get("take_profit")),
-        "confidence": _f(row.get("confidence")),
-        "agent_action": row.get("agent_action") or "",
-        "model": row.get("model") or "",
-        "alert_reason": row.get("alert_reason") or "",
+        "stop_loss": _f(upgraded.get("stop_loss")),
+        "take_profit": _f(upgraded.get("take_profit")),
+        "confidence": _f(upgraded.get("confidence")),
+        "agent_action": upgraded.get("agent_action") or "",
+        "model": upgraded.get("model") or "",
+        "alert_reason": upgraded.get("alert_reason") or "",
         "rationale": rationale,
-        "pnl": _f(pnl_m.group(1)) if pnl_m else None,
-        "hit": hit_m.group(1) if hit_m else "",
-        "adx": _f(row.get("adx")),
-        "loss_streak": row.get("loss_streak") or "",
+        "pnl": _f(upgraded.get("pnl")),
+        "hit": hit,
+        "adx": _f(upgraded.get("adx")),
+        "loss_streak": upgraded.get("loss_streak") or "",
     }
 
 
@@ -1135,7 +1172,9 @@ PAGE = r"""<!DOCTYPE html>
       try {
         const token = new URLSearchParams(location.search).get("token") || "";
         const qs = token ? ("?token=" + encodeURIComponent(token)) : "";
-        const res = await fetch("/api/snapshot" + qs, { cache: "no-store" });
+        const headers = {};
+        if (token) headers["X-Dashboard-Token"] = token;
+        const res = await fetch("/api/snapshot" + qs, { cache: "no-store", headers });
         if (res.status === 401) throw new Error("add ?token= from DASHBOARD_SECRET or WEBHOOK_SECRET");
         if (!res.ok) throw new Error("HTTP " + res.status);
         render(await res.json());
@@ -1202,14 +1241,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Refusing to start: {exc}", file=sys.stderr)
         return 1
     if secret:
-        auth = "token required off localhost (?token=)"
+        auth = "token required for the page and /api/snapshot"
     else:
         auth = "open on localhost only (set DASHBOARD_SECRET before a public bind or tunnel)"
     print(f"Dashboard on http://{host}:{args.port}  (read-only, {auth})")
     if secret:
-        print(f"  local bookmark : http://127.0.0.1:{args.port}/?token=<DASHBOARD_SECRET or WEBHOOK_SECRET>")
-        print(f"  phone          : cloudflared tunnel --url http://localhost:{args.port}")
-        print("                  then open https://<printed-host>/?token=<same secret>")
+        print("  Send the secret as ?token=, header X-Dashboard-Token, or Authorization: Bearer.")
+        print("  The secret is not printed here.")
+        print(f"  phone          : cloudflared tunnel --url http://127.0.0.1:{args.port}")
+        print("                  then open https://<printed-host>/?token=<your secret>")
+        print("  Prefer an SSH tunnel: ssh -L 8050:127.0.0.1:8050 user@vps")
     uvicorn.run(app, host=host, port=args.port, log_level="info")
     return 0
 

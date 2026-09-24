@@ -15,9 +15,9 @@ crosses above EMA 21. Stops and targets are 15m ATR multiples.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import pandas as pd
+from dotenv import load_dotenv
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -42,6 +43,7 @@ from core.broker import (
     truncate_price,
 )
 from core.config import (
+    ENV_PATH,
     ALLOW_LIVE_TRADING,
     ATR_PROFIT_MULTIPLIER,
     ATR_STOP_MULTIPLIER,
@@ -66,6 +68,7 @@ from core.config import (
     migrate_position_book,
 )
 from core.gemini_agent import Decision, GeminiAgent
+from core.gemini_stats import bump_stat, load_stats
 from core.order_lifecycle import (
     assert_live_trading_allowed,
     build_pending_entry,
@@ -80,6 +83,9 @@ from core.market_data import (
     classify_macro_regime,
     fetch_ohlcv,
 )
+from core.paper_book import archive_json, sum_runner_closed_pnl
+from core.symbols import canonical_pairs, normalize_trading_symbol, reconcile_book, reconcile_pending
+from core.trade_log import append_row
 from strategies import load_strategy
 
 log = logging.getLogger("runner")
@@ -92,12 +98,6 @@ TRIGGER_CANDLES = 100
 #: Spot book: at most one of these alts can be open alongside BTC (or alone).
 ALT_SYMBOLS = frozenset({"ETH/USD", "SOL/USD"})
 BTC_SYMBOL = "BTC/USD"
-
-TRADE_LOG_FIELDS = [
-    "timestamp", "symbol", "action", "entry_price", "stop_loss", "take_profit",
-    "verdict", "confidence", "agent_action", "model", "alert_reason",
-    "adx", "macro_ema", "loss_streak", "rationale",
-]
 
 TIMEFRAME_DELTAS = {
     "1m": pd.Timedelta(minutes=1),
@@ -167,6 +167,8 @@ class RunnerState:
     position: dict[str, Any] | None = None
     #: Resting live entry orders keyed by symbol. Not open positions.
     pending_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ISO timestamp of the last paper reset. Older CSV P&L is not applied again.
+    book_reset_at: str | None = None
 
 
 @dataclass
@@ -198,6 +200,7 @@ class CycleReport:
     macro_regime: str = "NEUTRAL"
     #: symbol -> resting live order id, while the local slot is still flat.
     pending: dict[str, str] = field(default_factory=dict)
+    gemini_stats: dict[str, int] = field(default_factory=dict)
 
 
 def timeframe_delta(timeframe: str) -> pd.Timedelta:
@@ -498,14 +501,13 @@ def apply_breaker(
     return state
 
 
-def append_row(path: Path, row: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not path.exists() or path.stat().st_size == 0
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=TRADE_LOG_FIELDS)
-        if is_new:
-            writer.writeheader()
-        writer.writerow({key: row.get(key, "") for key in TRADE_LOG_FIELDS})
+def _transient_agent_error(exc: Exception) -> bool:
+    """True for a Gemini 503/timeout style failure that is worth one more try."""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        token in text
+        for token in ("503", "502", "504", "500", "429", "timeout", "unavailable", "servererror")
+    )
 
 
 def _position_from_dict(raw: dict[str, Any] | None) -> Position | None:
@@ -642,6 +644,8 @@ class StrategyRunner:
         balance_fn: Callable[[], float] | None = None,
         order_fn: Callable[..., Any] | None = None,
         fetch_order_fn: Callable[..., Any] | None = None,
+        reset_paper: bool = False,
+        gemini_retry_sleep: float = 1.5,
     ) -> None:
         self._settings = None
         self.fetch_fn = fetch_fn or fetch_ohlcv
@@ -690,6 +694,20 @@ class StrategyRunner:
             self.use_post_only = (
                 bool(self.settings.use_post_only) if use_post_only is None else bool(use_post_only)
             )
+        raw_pairs = self.pairs
+        self.pairs = canonical_pairs(raw_pairs)
+        normalized_symbol = normalize_trading_symbol(self.symbol) if self.symbol else None
+        if normalized_symbol:
+            self.symbol = normalized_symbol
+        if self.pairs != tuple(raw_pairs):
+            log.warning(
+                "trading pairs normalized to the Kraken USD book: %s",
+                " ".join(self.pairs),
+            )
+        self.gemini_retry_sleep = max(0.0, float(gemini_retry_sleep))
+        self.reset_paper = bool(reset_paper)
+        self._minted_fresh_paper = False
+        self._loaded_existing_state = False
         self.fetch_delay = 1.0 if fetch_delay is None else max(0.0, float(fetch_delay))
         self.timeframe = timeframe if timeframe is not None else self.trigger_timeframe
         self.exchange_id = exchange_id if exchange_id is not None else self.settings.exchange_id
@@ -713,8 +731,17 @@ class StrategyRunner:
         self.fetch_order_fn = fetch_order_fn
         self._resolved_entries: dict[str, str] = {}
         self.pair_limits = pair_limits if pair_limits is not None else self._load_pair_limits(pairs is None)
+        self.stats_path = self.state_path.parent / "gemini_stats.json"
         self.state = self._load_state()
         self._separate_books()
+        self._reconcile_symbols()
+        if self.reset_paper:
+            if self.paper_trading:
+                self._reset_paper_book()
+            else:
+                log.error("refusing paper reset because paper mode is off; live state was not wiped")
+        elif self.paper_trading and self._loaded_existing_state and not self._minted_fresh_paper:
+            self._absorb_stuck_equity()
         if not self.paper_trading:
             # Fail before any private balance or order call when the live gate is shut.
             assert_live_trading_allowed(self.paper_trading, self.allow_live_trading)
@@ -1039,6 +1066,7 @@ class StrategyRunner:
     def _load_state(self) -> RunnerState:
         pairs = self.pairs
         if self.state_path.exists():
+            self._loaded_existing_state = True
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
             positions = migrate_position_book(raw, pairs)
             breaker = migrate_circuit_breaker(raw)
@@ -1061,6 +1089,7 @@ class StrategyRunner:
                 positions=positions,
                 position=legacy_open_slot(positions),
                 pending_orders=self._pending_from_state(raw.get("pending_orders")),
+                book_reset_at=raw.get("book_reset_at") or None,
             )
         return RunnerState(
             equity=self.starting_equity,
@@ -1091,6 +1120,7 @@ class StrategyRunner:
             pairs=self.pairs,
             pending_orders=self.state.pending_orders,
             book_name="paper" if self.paper_trading else "live",
+            book_reset_at=self.state.book_reset_at,
         )
         self._write_json(self.state_path, payload)
         mirror = self.state_path.parent / ("paper.json" if self.paper_trading else "live.json")
@@ -1123,17 +1153,112 @@ class StrategyRunner:
             archived = dict(raw)
             archived["book"] = "live"
             self._write_json(parent / "live.json", archived)
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._minted_fresh_paper = True
             self.state = RunnerState(
                 equity=float(self.starting_equity),
                 start_equity=float(self.starting_equity),
                 equity_history=[float(self.starting_equity)],
                 positions=empty_position_book(self.pairs),
+                book_reset_at=now,
             )
             self.save_state()
         elif (not self.paper_trading) and kind == "paper":
             archived = dict(raw)
             archived["book"] = "paper"
             self._write_json(parent / "paper.json", archived)
+
+    def _reconcile_symbols(self) -> None:
+        """Fold quote aliases onto the USD book and drop ghosts the scan cannot manage."""
+        if self._minted_fresh_paper:
+            return
+        positions, notes = reconcile_book(
+            self.state.positions,
+            self.pairs,
+            paper=self.paper_trading,
+        )
+        pending, pending_notes = reconcile_pending(
+            self.state.pending_orders,
+            self.pairs,
+            paper=self.paper_trading,
+        )
+        notes.extend(pending_notes)
+        self.state.positions = positions
+        self.state.pending_orders = pending
+        self.state.position = legacy_open_slot(positions)
+        if not notes:
+            return
+        for note in notes:
+            log.warning(
+                "symbol book %s %s -> %s (%s)",
+                note.get("action"),
+                note.get("symbol"),
+                note.get("canonical") or "-",
+                note.get("reason"),
+            )
+        self._write_quarantine(notes)
+        self.save_state()
+
+    def _write_quarantine(self, notes: list[dict[str, Any]]) -> None:
+        path = self.state_path.parent / "quarantine_positions.json"
+        existing: list[Any] = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded = None
+            if isinstance(loaded, list):
+                existing = loaded
+            elif isinstance(loaded, dict) and isinstance(loaded.get("items"), list):
+                existing = list(loaded["items"])
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for note in notes:
+            existing.append({"at": stamp, "paper": self.paper_trading, **note})
+        self._write_json(path, {"items": existing})
+
+    def _reset_paper_book(self) -> None:
+        """Archive the current paper state and start again at the paper balance."""
+        archive_json(self.state_path, prefix="paper")
+        mirror = self.state_path.parent / "paper.json"
+        if mirror.exists() and mirror.resolve() != self.state_path.resolve():
+            archive_json(mirror, prefix="paper-mirror")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        baseline = float(self._paper_baseline)
+        self.starting_equity = baseline
+        self.state = RunnerState(
+            equity=baseline,
+            start_equity=baseline,
+            equity_history=[baseline],
+            positions=empty_position_book(self.pairs),
+            book_reset_at=now,
+        )
+        self.save_state()
+        log.warning("paper book reset to %.2f; previous paper state archived", baseline)
+
+    def _absorb_stuck_equity(self) -> None:
+        """If equity never left the start balance, add runner CLOSE P&L from the CSV."""
+        start = self.state.start_equity
+        if start is None:
+            return
+        if abs(float(self.state.equity) - float(start)) > 0.05:
+            return
+        total = sum_runner_closed_pnl(self.trade_log, since=self.state.book_reset_at)
+        if abs(total) < 0.005:
+            return
+        self.state.equity = float(start) + total
+        log.warning(
+            "paper equity was stuck at %.2f; applied closed-trade P&L %.2f -> equity %.2f",
+            float(start),
+            total,
+            self.state.equity,
+        )
+        self.save_state()
+
+    def _bump_stat(self, kind: str) -> None:
+        try:
+            bump_stat(self.stats_path, kind)
+        except OSError as exc:
+            log.warning("could not write gemini stats: %s", exc)
 
     def _base_row(
         self,
@@ -1144,11 +1269,16 @@ class StrategyRunner:
         symbol: str | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        exit_price = extra.get("exit_price", "")
+        pnl = extra.get("pnl", "")
         return {
             "timestamp": now,
             "symbol": symbol or self.symbol,
             "action": action,
-            "entry_price": price,
+            "entry_price": "" if price is None else price,
+            "exit_price": "" if exit_price is None else exit_price,
+            "pnl": "" if pnl is None else pnl,
+            "hit": extra.get("hit", ""),
             "stop_loss": extra.get("stop_loss", signal.stop if signal else ""),
             "take_profit": extra.get("take_profit", signal.target if signal else ""),
             "verdict": extra.get("verdict", ""),
@@ -1160,6 +1290,7 @@ class StrategyRunner:
             "macro_ema": extra.get("macro_ema", signal.macro_ema if signal else ""),
             "loss_streak": self.state.loss_streak,
             "rationale": extra.get("rationale", ""),
+            "source": extra.get("source", "runner"),
         }
 
     def _close_position(self, symbol: str, position: Position, exit_event: Exit, bar: pd.Series) -> str | None:
@@ -1168,6 +1299,15 @@ class StrategyRunner:
         pnl = close_pnl(position, exit_event.price, float(self.params.get("commission_pct", 0.075)))
         self.state.equity += pnl
         self.state.loss_streak = self.state.loss_streak + 1 if pnl < 0 else 0
+        log.info(
+            "closed %s %s entry=%.4f exit=%.4f pnl=%.2f equity=%.2f",
+            symbol,
+            position.side,
+            position.entry_price,
+            exit_event.price,
+            pnl,
+            self.state.equity,
+        )
         previous = self.state.positions.get(symbol) or {}
         self.state.positions[symbol] = empty_position_slot(
             macro_regime=str(previous.get("macro_regime") or "UNKNOWN")
@@ -1179,10 +1319,13 @@ class StrategyRunner:
             self.trade_log,
             self._base_row(
                 "CLOSE",
-                exit_event.price,
+                position.entry_price,
                 None,
                 {
                     "verdict": "CONFIRMED",
+                    "exit_price": exit_event.price,
+                    "pnl": round(pnl, 4),
+                    "hit": exit_event.hit,
                     "stop_loss": position.trail_stop,
                     "take_profit": position.target,
                     "alert_reason": exit_event.reason,
@@ -1192,6 +1335,7 @@ class StrategyRunner:
                         f"exit {position.side} entry={position.entry_price:.4f} "
                         f"fill={exit_event.price:.4f} pnl={pnl:.2f} hit={exit_event.hit}"
                     ),
+                    "source": "runner",
                 },
                 symbol=symbol,
             ),
@@ -1207,6 +1351,7 @@ class StrategyRunner:
         macro_regime: str,
         qty: float,
     ) -> Position:
+        # Strategy ATR levels win. Gemini cannot replace the stop or the target.
         stop = signal.stop
         target = signal.target
         side: Literal["LONG", "SHORT"] = "LONG" if signal.action == "BUY" else "SHORT"
@@ -1241,17 +1386,31 @@ class StrategyRunner:
         return position
 
     def _confirm(self, signal: Signal, snapshot: dict[str, Any]) -> tuple[str, str, Decision | None]:
-        """Return (verdict, reason, decision). Fail closed if the agent is down."""
+        """Return (verdict, reason, decision). Fail closed if the agent is down.
+
+        Called only after hard risk gates (regime, breaker, alt cap, size).
+        A Gemini REJECT, HOLD, or low confidence cannot open a position, and
+        the model's stop and target are ignored.
+        """
         try:
-            decision = self.get_agent().decide(snapshot, self.strategy_context())
+            decision = self._decide_with_one_retry(snapshot)
         except Exception as exc:  # noqa: BLE001
-            log.error("agent unavailable, declining entry: %s", exc)
+            log.error(
+                "Gemini unavailable; fail closed; entry rejected; no order sent: %s",
+                exc,
+            )
+            self._bump_stat("agent_unavailable")
             return "REJECTED", "agent_unavailable", None
 
+        if decision.action == "REJECT":
+            self._bump_stat("rejected")
+            return "REJECTED", "agent_rejected", decision
         agrees = decision.action == signal.action
         confident = decision.confidence >= self.min_confidence
         if agrees and confident:
+            self._bump_stat("confirmed")
             return "CONFIRMED", "agent_agrees", decision
+        self._bump_stat("rejected")
         if not agrees:
             return "REJECTED", f"agent_returned_{decision.action}", decision
         return (
@@ -1259,6 +1418,17 @@ class StrategyRunner:
             f"confidence_{decision.confidence:.2f}_below_{self.min_confidence:.2f}",
             decision,
         )
+
+    def _decide_with_one_retry(self, snapshot: dict[str, Any]) -> Decision:
+        """One extra attempt after a 503/timeout. Other errors fail immediately."""
+        try:
+            return self.get_agent().decide(snapshot, self.strategy_context())
+        except Exception as exc:
+            if not _transient_agent_error(exc):
+                raise
+            log.warning("Gemini unavailable (%s); backing off and retrying once", exc)
+            time.sleep(self.gemini_retry_sleep)
+            return self.get_agent().decide(snapshot, self.strategy_context())
 
     def _exit_bars(self, position: Position, last: pd.Series, live: pd.Series) -> list[pd.Series]:
         """Bars whose range can close `position`, excluding the bar it opened on."""
@@ -1560,7 +1730,11 @@ class StrategyRunner:
                     if item["reason"] == "flat_no_signal":
                         item["reason"] = "no_entry_signal"
             except Exception as exc:  # noqa: BLE001
-                log.error("agent unavailable on dry-run consult: %s", exc)
+                log.error(
+                    "Gemini unavailable; fail closed; dry-run consult rejected; no order sent: %s",
+                    exc,
+                )
+                self._bump_stat("agent_unavailable")
                 for item in prepared:
                     if item["verdict"] is None:
                         item["verdict"] = "REJECTED"
@@ -1589,6 +1763,11 @@ class StrategyRunner:
         primary.equity = self.state.equity
         primary.breaker_active = self.state.breaker_active
         primary.loss_streak = self.state.loss_streak
+        primary.gemini_stats = {
+            key: int(value)
+            for key, value in load_stats(self.stats_path).items()
+            if key in {"confirmed", "rejected", "agent_unavailable"}
+        }
         return primary
 
     def _leg_report(self, item: dict[str, Any]) -> CycleReport:
@@ -1655,6 +1834,13 @@ def format_report(report: CycleReport) -> str:
         f"equity     : {equity}",
         f"model      : {report.model or '—'}",
     ]
+    if report.gemini_stats:
+        confirmed = int(report.gemini_stats.get("confirmed") or 0)
+        rejected = int(report.gemini_stats.get("rejected") or 0)
+        unavailable = int(report.gemini_stats.get("agent_unavailable") or 0)
+        lines.append(
+            f"gemini cnt : confirmed={confirmed} rejected={rejected} unavailable={unavailable}"
+        )
     if report.book:
         book = " ".join(f"{symbol}={status}" for symbol, status in report.book.items())
         lines.append(f"book       : {book}")
@@ -1689,6 +1875,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "on a new closed trigger bar; polls also catch intra-bar stop/target hits."
         ),
     )
+    parser.add_argument(
+        "--reset-paper",
+        action="store_true",
+        help=(
+            "Archive the paper state and start equity/start_equity at PAPER_STARTING_BALANCE "
+            "(default 10000). Refuses to run when paper mode is off. Does not delete live.json."
+        ),
+    )
     parser.add_argument("--symbol", default=None, help="Override SYMBOL (default from .env, BTC/USD)")
     parser.add_argument("--timeframe", default=None, help="Override trigger timeframe (default 15m)")
     parser.add_argument("--exchange", default=None, help="Override EXCHANGE_ID (default kraken)")
@@ -1697,12 +1891,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    load_dotenv(ENV_PATH, override=False)
     args = parse_args(argv)
+    reset_paper = bool(args.reset_paper) or os.getenv("RESET_PAPER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if reset_paper and not args.reset_paper:
+        log.warning(
+            "RESET_PAPER is set; the paper book resets on this start. "
+            "Unset it after this run or every restart will wipe the paper book."
+        )
     runner = StrategyRunner(
         symbol=args.symbol,
         timeframe=args.timeframe,
         exchange_id=args.exchange,
         pairs=(args.symbol,) if args.symbol else None,
+        reset_paper=reset_paper,
     )
 
     def run_once(consult_always: bool) -> CycleReport:
