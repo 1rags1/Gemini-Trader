@@ -55,6 +55,7 @@ from core.config import (
     TRADING_PAIRS,
     TRIGGER_TIMEFRAME,
     USE_POST_ONLY,
+    classify_book,
     dump_runner_state,
     empty_position_book,
     empty_position_slot,
@@ -713,6 +714,7 @@ class StrategyRunner:
         self._resolved_entries: dict[str, str] = {}
         self.pair_limits = pair_limits if pair_limits is not None else self._load_pair_limits(pairs is None)
         self.state = self._load_state()
+        self._separate_books()
         if not self.paper_trading:
             # Fail before any private balance or order call when the live gate is shut.
             assert_live_trading_allowed(self.paper_trading, self.allow_live_trading)
@@ -1088,10 +1090,50 @@ class StrategyRunner:
             else self.starting_equity,
             pairs=self.pairs,
             pending_orders=self.state.pending_orders,
+            book_name="paper" if self.paper_trading else "live",
         )
-        tmp = self.state_path.with_suffix(".tmp")
+        self._write_json(self.state_path, payload)
+        mirror = self.state_path.parent / ("paper.json" if self.paper_trading else "live.json")
+        if mirror.resolve() != self.state_path.resolve():
+            self._write_json(mirror, payload)
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self.state_path)
+        tmp.replace(path)
+
+    def _separate_books(self) -> None:
+        """Keep a live Kraken baseline out of the practice book, and the reverse.
+
+        A shared runner.json used to adopt whichever equity was saved last. A
+        ~$500 live deposit must not become the $10,000 paper account.
+        """
+        if not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, dict):
+            return
+        kind = classify_book(raw, float(self._paper_baseline))
+        parent = self.state_path.parent
+        if self.paper_trading and kind == "live":
+            archived = dict(raw)
+            archived["book"] = "live"
+            self._write_json(parent / "live.json", archived)
+            self.state = RunnerState(
+                equity=float(self.starting_equity),
+                start_equity=float(self.starting_equity),
+                equity_history=[float(self.starting_equity)],
+                positions=empty_position_book(self.pairs),
+            )
+            self.save_state()
+        elif (not self.paper_trading) and kind == "paper":
+            archived = dict(raw)
+            archived["book"] = "paper"
+            self._write_json(parent / "paper.json", archived)
 
     def _base_row(
         self,

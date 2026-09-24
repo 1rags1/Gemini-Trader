@@ -954,6 +954,52 @@ def test_live_anchors_start_equity_and_trade_log_name() -> None:
     print("    live start_equity + live_trades.csv")
 
 
+def test_paper_does_not_adopt_live_deposit() -> None:
+    tmp = tmpdir()
+    (tmp / "runner.json").write_text(
+        json.dumps(
+            {
+                "equity": 500.0,
+                "start_equity": 500.0,
+                "book": "live",
+                "circuit_breaker": {"loss_streak": 0, "tripped": False, "cooldown_bars": 0},
+                "positions": {
+                    "BTC/USD": {
+                        "status": "LONG",
+                        "entry_price": 77000,
+                        "size": 0.01,
+                        "stop_loss": 76000,
+                        "take_profit": 80000,
+                        "entry_time": None,
+                        "macro_regime": "BULL",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = runner_for(
+        macro_bull_frame(),
+        trigger_cross_frame(),
+        StubAgent("HOLD", 0.0),
+        tmp,
+        paper_trading=True,
+        allow_live_trading=False,
+    )
+    assert runner.paper_trading is True
+    assert runner.state.equity == 10_000.0
+    assert runner.state.start_equity == 10_000.0
+    assert runner.state.positions["BTC/USD"]["status"] == "FLAT"
+    saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
+    assert saved["book"] == "paper"
+    assert saved["equity"] == 10_000.0
+    archived = json.loads((tmp / "live.json").read_text(encoding="utf-8"))
+    assert archived["book"] == "live"
+    assert archived["equity"] == 500.0
+    assert archived["positions"]["BTC/USD"]["status"] == "LONG"
+    print("    paper book stayed at 10000; 500 archived as live")
+
+
 def test_paper_does_not_place_exchange_orders() -> None:
     tmp = tmpdir()
     orders: list[tuple] = []
@@ -1124,6 +1170,7 @@ def main() -> int:
         ("live canceled ack", test_live_entry_canceled_clears_pending),
         ("live expired on next poll", test_live_resting_cancel_on_next_poll),
         ("live start_equity + trade log", test_live_anchors_start_equity_and_trade_log_name),
+        ("paper ignores live deposit", test_paper_does_not_adopt_live_deposit),
         ("paper places no order", test_paper_does_not_place_exchange_orders),
         ("restart recovery", test_restart_resumes_open_position_without_duplicate_entry),
         ("live missing keys fail closed", test_live_missing_keys_fails_closed_on_startup),

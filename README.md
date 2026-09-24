@@ -66,7 +66,9 @@ Dashboard (read-only, localhost):
 python -m core.dashboard
 ```
 
-Open `http://127.0.0.1:8050`. To listen on another interface, set `DASHBOARD_SECRET` (or `WEBHOOK_SECRET`) and start with `--host 0.0.0.0` or `DASHBOARD_HOST`. Without that secret the process refuses a public bind. A Cloudflare tunnel also requires the secret, including when the bind itself is localhost.
+Open `http://127.0.0.1:8050`. The page shows two books at once. **PRACTICE / PAPER** is fake money and starts at `PAPER_STARTING_BALANCE` (default $10,000). **LIVE / KRAKEN** is the real Kraken USD balance. With the default flags the banner says **ACTIVE: PAPER TRADING**, the practice panel is marked in use, and the Kraken panel stays idle even if a last-known balance is on disk. The dashboard never sends an order.
+
+To listen on another interface, set `DASHBOARD_SECRET` (or `WEBHOOK_SECRET`) and start with `--host 0.0.0.0` or `DASHBOARD_HOST`. Without that secret the process refuses a public bind. A Cloudflare tunnel also requires the secret, including when the bind itself is localhost.
 
 TradingView webhook (paper log only):
 
