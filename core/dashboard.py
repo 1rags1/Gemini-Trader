@@ -1,10 +1,12 @@
 """Read-only dashboard for the paper / live Kraken runner.
 
 Serves a single Tailwind page on 127.0.0.1:8050 and a JSON snapshot the browser
-polls every 10 seconds. Binding another host requires DASHBOARD_SECRET (or
-WEBHOOK_SECRET). When that secret is set, every page and snapshot request
-must present it. File reads are short-lived and shared, so this process never
-locks `state/runner.json` or the trade CSV away from the runner.
+polls every 10 seconds. The page keeps a connection banner and does not treat
+the HTML placeholder as live equity until a snapshot succeeds. Binding another
+host requires DASHBOARD_SECRET (or WEBHOOK_SECRET). When that secret is set,
+every page and snapshot request must present it. File reads are short-lived
+and shared, so this process never locks `state/runner.json` or the trade CSV
+away from the runner.
 
     python -m core.dashboard
 """
@@ -66,6 +68,11 @@ MARKET_CACHE_TTL = 20.0
 MACRO_CANDLES = 250
 TRIGGER_CANDLES = 100
 MARKET_FETCH_DELAY = 1.0
+# Browser shows STALE when the last good snapshot is older than this, even if
+# the last HTTP poll returned 200. The runner file uses a wider window because
+# the default poll is 30s and a cycle can include exchange and Gemini time.
+SNAPSHOT_STALE_SECONDS = 60
+RUNNER_STALE_SECONDS = 120
 
 _HIT_RE = re.compile(r"hit=(\w+)")
 
@@ -837,6 +844,70 @@ def fetch_market() -> dict[str, Any]:
     return payload
 
 
+def read_state_feed(*, active_mode: str) -> dict[str, Any]:
+    """Age of the newest state file for the active book.
+
+    ``runner.json`` is mirrored to ``paper.json`` or ``live.json``. The freshest
+    of those is the runner heartbeat the page uses for STALE.
+    """
+    paths = _book_paths()
+    if active_mode == "live":
+        candidates = [paths["live"], paths["runner"]]
+    else:
+        candidates = [paths["paper"], paths["runner"]]
+    best_age: float | None = None
+    best_at: str | None = None
+    best_name: str | None = None
+    now = time.time()
+    for path in candidates:
+        try:
+            if path is None or not path.exists():
+                continue
+            mtime = path.stat().st_mtime
+        except OSError as exc:
+            log.warning("state mtime unreadable %s: %s", path, exc)
+            continue
+        age = max(0.0, now - mtime)
+        if best_age is None or age < best_age:
+            best_age = age
+            best_at = datetime.fromtimestamp(mtime, timezone.utc).isoformat(timespec="seconds")
+            best_name = path.name
+    return {
+        "stale_after_seconds": SNAPSHOT_STALE_SECONDS,
+        "runner_stale_after_seconds": RUNNER_STALE_SECONDS,
+        "state_present": best_age is not None,
+        "state_file": best_name,
+        "state_updated_at": best_at,
+        "state_age_seconds": None if best_age is None else round(best_age, 1),
+    }
+
+
+def snapshot_is_complete(payload: Any) -> bool:
+    """True only when a snapshot has a paper equity and a trade list.
+
+    A 200 with a partial body must not be painted as a flat book.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if not payload.get("generated_at"):
+        return False
+    paper = payload.get("paper")
+    live = payload.get("live")
+    trades = payload.get("trades")
+    if not isinstance(paper, dict) or not isinstance(live, dict):
+        return False
+    if not isinstance(trades, dict) or not isinstance(trades.get("trades"), list):
+        return False
+    equity = paper.get("equity")
+    if equity is None or equity == "":
+        return False
+    try:
+        float(equity)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def build_snapshot() -> dict[str, Any]:
     panels = build_account_panels(peek_balance=True)
     state = _flatten_active(panels)
@@ -859,6 +930,7 @@ def build_snapshot() -> dict[str, Any]:
         "paper_trades": paper_trades,
         "live_trades": live_trades,
         "rejects": read_reject_count(),
+        "feed": read_state_feed(active_mode=panels["active_mode"]),
     }
 
 
@@ -884,15 +956,24 @@ PAGE = r"""<!DOCTYPE html>
   <style>
     body { font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
     .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+    body[data-feed="waiting"] #books,
+    body[data-feed="stale"] #books,
+    body[data-feed="disconnected"] #books { opacity: 0.5; }
+    #conn-banner { position: sticky; top: 0.75rem; z-index: 30; }
   </style>
 </head>
-<body class="bg-ink text-slate-200 min-h-screen">
+<body class="bg-ink text-slate-200 min-h-screen" data-feed="waiting" data-loaded="0">
   <div class="max-w-6xl mx-auto px-5 py-6">
+    <section id="conn-banner" class="mb-4 rounded-xl border border-slate-500/50 bg-slate-700/40 px-4 py-3">
+      <p id="conn-title" role="status" aria-live="polite" class="text-lg sm:text-xl font-semibold tracking-wide text-slate-100">WAITING FOR LIVE DATA</p>
+      <p id="conn-detail" class="text-sm text-slate-200 mt-1">Waiting for live data… Equity stays blank until /api/snapshot succeeds. This is not a live $10,000 book.</p>
+    </section>
+
     <header class="flex flex-wrap items-end justify-between gap-3 mb-4">
       <div>
         <p class="text-xs uppercase tracking-[0.2em] text-teal-400/80">Gemini Trend Guard</p>
         <div class="flex flex-wrap items-center gap-3 mt-1">
-          <h1 id="desk-title" class="text-2xl font-semibold text-white">Paper desk</h1>
+          <h1 id="desk-title" class="text-2xl font-semibold text-white">Monitor</h1>
           <span id="live-badge" class="hidden inline-flex items-center gap-1.5 text-xs font-medium text-emerald-300 bg-emerald-500/10 ring-1 ring-emerald-500/30 px-2.5 py-1 rounded-md">● LIVE KRAKEN (USD)</span>
         </div>
         <p class="text-sm text-slate-400">Read-only monitor · does not place orders · does not lock the runner</p>
@@ -900,29 +981,29 @@ PAGE = r"""<!DOCTYPE html>
       <div class="text-right text-sm text-slate-400">
         <div>Updated <span id="updated" class="mono text-slate-200">—</span></div>
         <div>Next refresh in <span id="countdown" class="mono text-teal-300">10</span>s</div>
-        <div id="status" class="text-xs mt-1 text-slate-500">connecting…</div>
+        <div id="status" class="text-xs mt-1 text-slate-500">waiting for live data…</div>
       </div>
     </header>
 
-    <section id="mode-banner" class="mb-4 rounded-xl border border-amber-300/50 bg-amber-400/10 px-4 py-3">
-      <p id="mode-banner-label" class="text-lg sm:text-xl font-semibold tracking-wide text-amber-100">ACTIVE: PAPER TRADING</p>
-      <p id="mode-detail" class="text-sm text-amber-50/80 mt-1">Practice book is running from $10,000.00 fake money. Live Kraken is idle — no live orders are firing.</p>
+    <section id="mode-banner" class="mb-4 rounded-xl border border-white/10 bg-panel px-4 py-3">
+      <p id="mode-banner-label" class="text-lg sm:text-xl font-semibold tracking-wide text-slate-200">WAITING FOR LIVE DATA</p>
+      <p id="mode-detail" class="text-sm text-slate-400 mt-1">Waiting for live data… Mode appears after a snapshot loads.</p>
     </section>
 
     <section id="books" class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-      <article id="paper-panel" class="rounded-xl border border-amber-300/80 ring-2 ring-amber-400/40 bg-panel p-4">
+      <article id="paper-panel" class="rounded-xl border border-white/10 bg-panel p-4">
         <div class="flex items-start justify-between gap-3">
           <div>
             <p class="text-xs uppercase tracking-[0.16em] text-amber-200/90">PRACTICE / PAPER</p>
             <p class="text-sm text-slate-300">Fake money</p>
           </div>
-          <span id="paper-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-amber-400/20 text-amber-100 ring-1 ring-amber-300/50">IN USE</span>
+          <span id="paper-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-500/20 text-slate-300 ring-1 ring-white/10">—</span>
         </div>
         <p id="equity-label" class="text-xs uppercase tracking-wider text-slate-400 mt-4">PAPER EQUITY</p>
-        <p id="paper-equity" class="text-3xl font-semibold mt-1 mono text-white">$10,000.00</p>
+        <p id="paper-equity" class="text-3xl font-semibold mt-1 mono text-slate-400">Waiting for live data…</p>
         <p id="paper-pnl" class="text-sm mt-2 text-slate-400">—</p>
-        <p id="paper-note" class="text-xs text-slate-400 mt-2">Configured practice balance. No paper fills yet.</p>
-        <p id="paper-status" class="text-sm mt-3 text-amber-100">Practice book is running.</p>
+        <p id="paper-note" class="text-xs text-slate-400 mt-2">Waiting for live data…</p>
+        <p id="paper-status" class="text-sm mt-3 text-slate-400">Waiting for live data…</p>
         <div id="paper-positions" class="mt-3 space-y-2"></div>
       </article>
       <article id="live-panel" class="rounded-xl border border-white/10 bg-panel p-4 opacity-60">
@@ -931,13 +1012,13 @@ PAGE = r"""<!DOCTYPE html>
             <p class="text-xs uppercase tracking-[0.16em] text-rose-200/80">LIVE / KRAKEN</p>
             <p class="text-sm text-slate-400">Real money</p>
           </div>
-          <span id="live-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-500/20 text-slate-300 ring-1 ring-white/10">NOT IN USE</span>
+          <span id="live-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-500/20 text-slate-300 ring-1 ring-white/10">—</span>
         </div>
         <p id="live-equity-label" class="text-xs uppercase tracking-wider text-slate-500 mt-4">LIVE KRAKEN EQUITY</p>
-        <p id="live-equity" class="text-3xl font-semibold mt-1 mono text-slate-300">Live not active</p>
+        <p id="live-equity" class="text-3xl font-semibold mt-1 mono text-slate-400">Waiting for live data…</p>
         <p id="live-pnl" class="text-sm mt-2 text-slate-500">—</p>
-        <p id="live-note" class="text-xs text-slate-500 mt-2">IDLE — live orders are not firing.</p>
-        <p id="live-status" class="text-sm mt-3 text-slate-400">IDLE — live orders are not firing.</p>
+        <p id="live-note" class="text-xs text-slate-500 mt-2">Waiting for live data…</p>
+        <p id="live-status" class="text-sm mt-3 text-slate-400">Waiting for live data…</p>
         <div id="live-positions" class="mt-3 space-y-2"></div>
       </article>
     </section>
@@ -963,7 +1044,9 @@ PAGE = r"""<!DOCTYPE html>
               <th class="px-3 py-2 font-medium text-right">15m ATR</th>
             </tr>
           </thead>
-          <tbody id="metrics" class="divide-y divide-white/5"></tbody>
+          <tbody id="metrics" class="divide-y divide-white/5">
+            <tr><td colspan="7" class="py-6 text-center text-slate-500">Waiting for live data…</td></tr>
+          </tbody>
         </table>
       </div>
     </section>
@@ -971,7 +1054,7 @@ PAGE = r"""<!DOCTYPE html>
     <section class="bg-panel rounded-xl border border-white/5 overflow-hidden">
       <div class="px-4 py-3 flex items-baseline justify-between border-b border-white/5">
         <h2 id="trade-heading" class="text-sm uppercase tracking-wider text-slate-400">Active book trade log</h2>
-        <p id="trade-meta" class="text-xs text-slate-500">—</p>
+        <p id="trade-meta" class="text-xs text-slate-500">Waiting for live data…</p>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
@@ -986,7 +1069,9 @@ PAGE = r"""<!DOCTYPE html>
               <th class="px-4 py-2 font-medium">Rationale</th>
             </tr>
           </thead>
-          <tbody id="trades" class="divide-y divide-white/5"></tbody>
+          <tbody id="trades" class="divide-y divide-white/5">
+            <tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">Waiting for live data…</td></tr>
+          </tbody>
         </table>
       </div>
     </section>
@@ -994,7 +1079,164 @@ PAGE = r"""<!DOCTYPE html>
 
   <script>
     const POLL_MS = 10000;
+    const FETCH_TIMEOUT_MS = 25000;
     let remaining = 10;
+    let inflight = false;
+    let everLoaded = false;
+    let lastGoodAt = null;
+    let pollProblem = null;
+    let lastHttpStatus = null;
+    let runnerPresent = false;
+    let runnerAgeAtReceipt = null;
+    let staleAfterSeconds = 60;
+    let runnerStaleAfterSeconds = 120;
+
+    /* __CONN_JS_START__ */
+    function snapshotComplete(data) {
+      if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+      if (!data.generated_at) return false;
+      const paper = data.paper;
+      const live = data.live;
+      const trades = data.trades;
+      if (!paper || typeof paper !== "object" || Array.isArray(paper)) return false;
+      if (!live || typeof live !== "object" || Array.isArray(live)) return false;
+      if (!trades || typeof trades !== "object" || !Array.isArray(trades.trades)) return false;
+      if (paper.equity == null || paper.equity === "") return false;
+      const equity = Number(paper.equity);
+      return !Number.isNaN(equity);
+    }
+
+    function classifyConnection(input) {
+      const staleAfter = Number(input.staleAfterSeconds) > 0 ? Number(input.staleAfterSeconds) : 60;
+      const runnerStaleAfter = Number(input.runnerStaleAfterSeconds) > 0 ? Number(input.runnerStaleAfterSeconds) : 120;
+      const age = input.snapshotAgeSeconds;
+      const ever = !!input.everLoaded;
+      const kind = input.problem || null;
+      const httpStatus = input.httpStatus;
+
+      function ageLabel(seconds) {
+        if (seconds == null || Number.isNaN(Number(seconds))) return "—";
+        const s = Math.max(0, Math.round(Number(seconds)));
+        if (s < 60) return s + "s";
+        const m = Math.floor(s / 60);
+        if (m < 60) return m + "m " + (s % 60) + "s";
+        const h = Math.floor(m / 60);
+        return h + "h " + (m % 60) + "m";
+      }
+
+      if (kind === "unauthorized" || httpStatus === 401) {
+        return {
+          level: "disconnected",
+          title: "DISCONNECTED / Not authorized",
+          detail: "The snapshot returned 401. Open this page with ?token= set to your DASHBOARD_SECRET or WEBHOOK_SECRET. Header X-Dashboard-Token or Authorization: Bearer works too. The secret is not shown here. Numbers on this page are not live.",
+          statusLine: "not authorized — open with ?token="
+        };
+      }
+      if (kind) {
+        const why = kind === "incomplete"
+          ? "The snapshot was incomplete (equity or trades missing)."
+          : kind === "timeout"
+            ? "The snapshot request timed out."
+            : kind === "http"
+              ? ("The snapshot request failed" + (httpStatus ? " (HTTP " + httpStatus + ")." : "."))
+              : "The snapshot request failed (network or tunnel down).";
+        return {
+          level: "disconnected",
+          title: "DISCONNECTED / Not updating",
+          detail: why + " Numbers may be wrong. Reconnect the tunnel and check the token. Polling continues; the banner returns to LIVE / Connected when a good snapshot arrives."
+            + (ever ? "" : " Waiting for live data…"),
+          statusLine: "not updating"
+        };
+      }
+      if (!ever) {
+        return {
+          level: "waiting",
+          title: "WAITING FOR LIVE DATA",
+          detail: "Waiting for live data… Equity stays blank until /api/snapshot succeeds. This is not a live $10,000 book.",
+          statusLine: "waiting for live data…"
+        };
+      }
+      const runnerIsPresent = !!input.runnerPresent;
+      const runnerAge = input.runnerAgeSeconds;
+      const runnerStale = runnerIsPresent && runnerAge != null && Number(runnerAge) > runnerStaleAfter;
+      const snapshotStale = age != null && Number(age) > staleAfter;
+      if (runnerStale || snapshotStale) {
+        const bits = [];
+        if (snapshotStale) bits.push("Last good snapshot is " + ageLabel(age) + " old");
+        if (runnerStale) bits.push("runner state file is " + ageLabel(runnerAge) + " old");
+        const pollNote = snapshotStale
+          ? "The book on screen is too old to trust."
+          : "The dashboard poll succeeded, but the runner state is too old to trust.";
+        return {
+          level: "stale",
+          title: "STALE",
+          detail: bits.join(" · ") + ". " + pollNote + " Numbers may be wrong.",
+          statusLine: "stale · " + ageLabel(age)
+        };
+      }
+      let detail = "Updated " + ageLabel(age) + " ago.";
+      if (runnerIsPresent && runnerAge != null) {
+        detail += " Runner state " + ageLabel(runnerAge) + " old.";
+      } else {
+        detail += " No runner state file on disk yet, so practice equity is only the configured balance.";
+      }
+      return {
+        level: "live",
+        title: "LIVE / Connected",
+        detail: detail,
+        statusLine: "connected · " + ageLabel(age) + " ago"
+      };
+    }
+    /* __CONN_JS_END__ */
+
+    function connectionInput(nowMs) {
+      const snapshotAge = lastGoodAt == null ? null : Math.max(0, (nowMs - lastGoodAt) / 1000);
+      let runnerAge = null;
+      if (runnerPresent && runnerAgeAtReceipt != null && lastGoodAt != null) {
+        runnerAge = runnerAgeAtReceipt + snapshotAge;
+      }
+      return {
+        everLoaded: everLoaded,
+        problem: pollProblem,
+        httpStatus: lastHttpStatus,
+        snapshotAgeSeconds: snapshotAge,
+        runnerPresent: runnerPresent,
+        runnerAgeSeconds: runnerAge,
+        staleAfterSeconds: staleAfterSeconds,
+        runnerStaleAfterSeconds: runnerStaleAfterSeconds
+      };
+    }
+
+    function paintConnection(nowMs) {
+      const view = classifyConnection(connectionInput(nowMs || Date.now()));
+      document.body.dataset.feed = view.level;
+      const banner = document.getElementById("conn-banner");
+      const title = document.getElementById("conn-title");
+      const detail = document.getElementById("conn-detail");
+      const styles = {
+        live: "mb-4 rounded-xl border border-emerald-400/60 bg-emerald-500/15 px-4 py-3",
+        stale: "mb-4 rounded-xl border-2 border-amber-300 bg-amber-400/20 px-4 py-4",
+        disconnected: "mb-4 rounded-xl border-2 border-rose-400 bg-rose-600/25 px-4 py-4",
+        waiting: "mb-4 rounded-xl border border-slate-500/50 bg-slate-700/40 px-4 py-3"
+      };
+      const titleTones = {
+        live: "text-emerald-100",
+        stale: "text-amber-50",
+        disconnected: "text-rose-50",
+        waiting: "text-slate-100"
+      };
+      banner.className = styles[view.level] || styles.waiting;
+      title.className = "text-lg sm:text-2xl font-semibold tracking-wide " + (titleTones[view.level] || titleTones.waiting);
+      if (title.textContent !== view.title) title.textContent = view.title;
+      detail.className = "text-sm mt-1 " + (view.level === "disconnected" ? "text-rose-50" : "text-slate-100");
+      if (detail.textContent !== view.detail) detail.textContent = view.detail;
+      const status = document.getElementById("status");
+      status.textContent = view.statusLine;
+      status.className = "text-xs mt-1 " + (
+        view.level === "live" ? "text-teal-400" :
+        view.level === "stale" ? "text-amber-300" : "text-rose-300"
+      );
+    }
 
     const fmt = (n, d=2) => n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d});
     const tonePos = (side) => ({LONG:"text-teal-300", SHORT:"text-rose-300", FLAT:"text-slate-200"}[side] || "text-slate-200");
@@ -1054,6 +1296,7 @@ PAGE = r"""<!DOCTYPE html>
       const equityEl = document.getElementById(prefix === "paper" ? "paper-equity" : "live-equity");
       if (panel.placeholder && panel.equity == null) equityEl.textContent = panel.placeholder;
       else equityEl.textContent = money(panel.equity);
+      equityEl.className = "text-3xl font-semibold mt-1 mono " + (inUse ? "text-white" : "text-slate-300");
       const pnlEl = document.getElementById(prefix + "-pnl");
       if (panel.pnl == null) {
         pnlEl.textContent = panel.placeholder ? "" : "P&L unavailable";
@@ -1169,29 +1412,61 @@ PAGE = r"""<!DOCTYPE html>
     }
 
     async function tick() {
+      if (inflight) return;
+      inflight = true;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
       try {
         const token = new URLSearchParams(location.search).get("token") || "";
         const qs = token ? ("?token=" + encodeURIComponent(token)) : "";
         const headers = {};
         if (token) headers["X-Dashboard-Token"] = token;
-        const res = await fetch("/api/snapshot" + qs, { cache: "no-store", headers });
-        if (res.status === 401) throw new Error("add ?token= from DASHBOARD_SECRET or WEBHOOK_SECRET");
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        render(await res.json());
-        document.getElementById("status").textContent = "connected";
-        document.getElementById("status").className = "text-xs mt-1 text-teal-400";
+        const res = await fetch("/api/snapshot" + qs, { cache: "no-store", headers, signal: ctrl.signal });
+        lastHttpStatus = res.status;
+        if (res.status === 401) {
+          pollProblem = "unauthorized";
+        } else if (!res.ok) {
+          pollProblem = "http";
+        } else {
+          let data = null;
+          try {
+            data = await res.json();
+          } catch (err) {
+            data = null;
+          }
+          if (!snapshotComplete(data)) {
+            pollProblem = "incomplete";
+          } else {
+            render(data);
+            everLoaded = true;
+            document.body.dataset.loaded = "1";
+            lastGoodAt = Date.now();
+            const feed = data.feed || {};
+            runnerPresent = !!feed.state_present;
+            runnerAgeAtReceipt = feed.state_age_seconds == null ? null : Number(feed.state_age_seconds);
+            if (Number(feed.stale_after_seconds) > 0) staleAfterSeconds = Number(feed.stale_after_seconds);
+            if (Number(feed.runner_stale_after_seconds) > 0) runnerStaleAfterSeconds = Number(feed.runner_stale_after_seconds);
+            pollProblem = null;
+          }
+        }
       } catch (e) {
-        document.getElementById("status").textContent = "poll failed: " + e.message;
-        document.getElementById("status").className = "text-xs mt-1 text-rose-300";
+        lastHttpStatus = null;
+        pollProblem = (e && e.name === "AbortError") ? "timeout" : "network";
+      } finally {
+        clearTimeout(timer);
+        inflight = false;
+        remaining = 10;
+        paintConnection(Date.now());
       }
-      remaining = 10;
     }
 
     setInterval(() => {
       remaining = Math.max(0, remaining - 1);
       document.getElementById("countdown").textContent = String(remaining);
+      paintConnection(Date.now());
     }, 1000);
     setInterval(tick, POLL_MS);
+    paintConnection(Date.now());
     tick();
   </script>
 </body>

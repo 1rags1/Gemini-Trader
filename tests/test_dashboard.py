@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +18,13 @@ from core.dashboard import (
     PAGE,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
+    RUNNER_STALE_SECONDS,
+    SNAPSHOT_STALE_SECONDS,
     _enrich_trade,
     desk_labels,
     read_runner_state,
+    read_state_feed,
+    snapshot_is_complete,
 )
 
 
@@ -38,8 +45,39 @@ def test_page_has_multi_pair_surfaces() -> None:
     assert "Real money" in PAGE
     assert "NOT IN USE" in PAGE
     assert "IN USE" in PAGE
-    assert "Live not active" in PAGE
     assert 'id="mode-banner"' in PAGE
+    assert 'id="conn-banner"' in PAGE
+    assert 'id="conn-title"' in PAGE
+    assert "WAITING FOR LIVE DATA" in PAGE
+    assert "Waiting for live data…" in PAGE
+    assert "LIVE / Connected" in PAGE
+    assert "DISCONNECTED / Not updating" in PAGE
+    assert "DISCONNECTED / Not authorized" in PAGE
+    assert ">STALE<" in PAGE or 'title: "STALE"' in PAGE
+    assert "Numbers may be wrong" in PAGE
+    assert "Reconnect the tunnel" in PAGE
+    assert "?token=" in PAGE
+    assert "DASHBOARD_SECRET" in PAGE
+    assert "WEBHOOK_SECRET" in PAGE
+    assert "The secret is not shown" in PAGE
+    assert "equity or trades missing" in PAGE
+    assert f"let staleAfterSeconds = {SNAPSHOT_STALE_SECONDS};" in PAGE
+    assert f"let runnerStaleAfterSeconds = {RUNNER_STALE_SECONDS};" in PAGE
+    assert SNAPSHOT_STALE_SECONDS == 60
+    assert RUNNER_STALE_SECONDS == 120
+    html = PAGE.split("/* __CONN_JS_START__ */", 1)[0]
+    equity_at = html.index('id="paper-equity"')
+    equity_snip = html[equity_at:equity_at + 160]
+    assert "Waiting for live data…" in equity_snip
+    assert "10,000" not in equity_snip
+    assert "$10,000.00" not in html
+    assert 'data-feed="waiting"' in html
+    assert "connecting…" not in PAGE
+    assert "poll failed:" not in PAGE
+    tick = PAGE.split("async function tick()", 1)[1]
+    assert tick.index("snapshotComplete") < tick.index("render(data)")
+    assert "pollProblem = null" in tick
+    print("    connection banner hides the $10k placeholder until a snapshot")
     assert 'id="paper-panel"' in PAGE
     assert 'id="live-panel"' in PAGE
     assert "lg:grid-cols-2" in PAGE
@@ -365,6 +403,172 @@ def test_dashboard_bind_requires_secret_off_localhost() -> None:
         get_settings.cache_clear()
 
 
+def test_snapshot_complete_requires_equity_and_trades() -> None:
+    assert snapshot_is_complete(None) is False
+    assert snapshot_is_complete({}) is False
+    assert snapshot_is_complete({"generated_at": "t", "paper": {}, "live": {}, "trades": {"trades": []}}) is False
+    assert snapshot_is_complete(
+        {
+            "generated_at": "t",
+            "paper": {"equity": None},
+            "live": {},
+            "trades": {"trades": []},
+        }
+    ) is False
+    assert snapshot_is_complete(
+        {
+            "generated_at": "t",
+            "paper": {"equity": 10000},
+            "live": {},
+            "trades": {"count": 0},
+        }
+    ) is False
+    assert snapshot_is_complete(
+        {
+            "generated_at": "t",
+            "paper": {"equity": 10000},
+            "live": {"equity": None, "placeholder": "Live not active"},
+            "trades": {"trades": []},
+        }
+    ) is True
+    print("    incomplete snapshot is not a book")
+
+
+def test_state_feed_age() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="gemini-dash-feed-"))
+    runner = tmp / "runner.json"
+    paper = tmp / "paper.json"
+    runner.write_text("{}", encoding="utf-8")
+    old = time.time() - 500
+    os.utime(runner, (old, old))
+    paper.write_text("{}", encoding="utf-8")
+
+    import core.dashboard as dash
+
+    original = dash._paths
+    dash._paths = lambda: {"state": runner, "trades": tmp / "paper_trades.csv", "rejects": tmp / "r.csv"}
+    try:
+        stale = read_state_feed(active_mode="paper")
+        missing = None
+        runner.unlink()
+        paper.unlink()
+        missing = read_state_feed(active_mode="paper")
+    finally:
+        dash._paths = original
+
+    assert stale["state_present"] is True
+    assert stale["state_file"] == "paper.json"
+    assert stale["state_age_seconds"] is not None and stale["state_age_seconds"] < 5
+    assert stale["stale_after_seconds"] == SNAPSHOT_STALE_SECONDS
+    assert stale["runner_stale_after_seconds"] == RUNNER_STALE_SECONDS
+    assert missing["state_present"] is False
+    assert missing["state_age_seconds"] is None
+    print("    runner file age is newest of paper.json and runner.json")
+
+
+def test_connection_classifier_js() -> None:
+    """Run the page's own classifier. A failed poll must not look live."""
+    start = PAGE.index("/* __CONN_JS_START__ */") + len("/* __CONN_JS_START__ */")
+    end = PAGE.index("/* __CONN_JS_END__ */")
+    src = PAGE[start:end]
+    waiting = {
+        "everLoaded": False,
+        "problem": None,
+        "httpStatus": None,
+        "snapshotAgeSeconds": None,
+        "runnerPresent": False,
+        "runnerAgeSeconds": None,
+        "staleAfterSeconds": 60,
+        "runnerStaleAfterSeconds": 120,
+    }
+    program = src + """
+const failures = [];
+function check(name, input, expect) {
+  const got = classifyConnection(input);
+  if (got.level !== expect.level) failures.push(name + " level " + got.level);
+  if (got.title !== expect.title) failures.push(name + " title " + got.title);
+  for (const bit of expect.has || []) {
+    if (!String(got.detail).includes(bit)) failures.push(name + " missing " + bit);
+  }
+  for (const bit of expect.lacks || []) {
+    if (String(got.detail).includes(bit) || String(got.title).includes(bit)) failures.push(name + " leaked " + bit);
+  }
+}
+const base = """ + json.dumps(waiting) + """;
+check("waiting", base, {level: "waiting", title: "WAITING FOR LIVE DATA", has: ["Waiting for live data"]});
+check("unauthorized", Object.assign({}, base, {problem: "unauthorized", httpStatus: 401}), {
+  level: "disconnected",
+  title: "DISCONNECTED / Not authorized",
+  has: ["401", "?token=", "DASHBOARD_SECRET", "WEBHOOK_SECRET", "not shown"],
+  lacks: ["dash-secret", "super-secret-value"]
+});
+check("offline", Object.assign({}, base, {problem: "network"}), {
+  level: "disconnected",
+  title: "DISCONNECTED / Not updating",
+  has: ["Numbers may be wrong", "Reconnect the tunnel", "Waiting for live data"]
+});
+check("offline-after-load", Object.assign({}, base, {problem: "network", everLoaded: true, snapshotAgeSeconds: 12}), {
+  level: "disconnected",
+  title: "DISCONNECTED / Not updating",
+  has: ["Numbers may be wrong"],
+  lacks: ["Waiting for live data"]
+});
+check("http", Object.assign({}, base, {problem: "http", httpStatus: 500, everLoaded: true}), {
+  level: "disconnected",
+  title: "DISCONNECTED / Not updating",
+  has: ["HTTP 500"]
+});
+check("timeout", Object.assign({}, base, {problem: "timeout"}), {
+  level: "disconnected",
+  title: "DISCONNECTED / Not updating",
+  has: ["timed out"]
+});
+check("incomplete", Object.assign({}, base, {problem: "incomplete", httpStatus: 200}), {
+  level: "disconnected",
+  title: "DISCONNECTED / Not updating",
+  has: ["equity or trades missing"]
+});
+check("live", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 3, runnerPresent: true, runnerAgeSeconds: 12}), {
+  level: "live",
+  title: "LIVE / Connected",
+  has: ["Updated 3s ago", "Runner state 12s old"]
+});
+check("stale-snapshot", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 61, runnerPresent: true, runnerAgeSeconds: 12}), {
+  level: "stale",
+  title: "STALE",
+  has: ["too old to trust", "Numbers may be wrong"]
+});
+check("stale-runner", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 3, runnerPresent: true, runnerAgeSeconds: 121}), {
+  level: "stale",
+  title: "STALE",
+  has: ["poll succeeded", "Numbers may be wrong"]
+});
+check("recover", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 1, runnerPresent: true, runnerAgeSeconds: 4, problem: null}), {
+  level: "live",
+  title: "LIVE / Connected",
+  has: ["Updated 1s ago"]
+});
+if (snapshotComplete(null) !== false) failures.push("null snapshot");
+if (snapshotComplete({generated_at: "t", paper: {}, live: {}, trades: {trades: []}}) !== false) failures.push("missing equity");
+if (snapshotComplete({generated_at: "t", paper: {equity: 10000}, live: {}, trades: {}}) !== false) failures.push("missing trades");
+if (snapshotComplete({generated_at: "t", paper: {equity: 10000}, live: {equity: null}, trades: {trades: []}}) !== true) failures.push("good snapshot");
+if (failures.length) {
+  console.error(failures.join("\\n"));
+  process.exit(1);
+}
+console.log("ok");
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", program],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+    print("    js classifier: waiting, 401, disconnect, stale, recover")
+
+
 def main() -> int:
     checks = [
         ("page surfaces", test_page_has_multi_pair_surfaces),
@@ -375,6 +579,9 @@ def main() -> int:
         ("paper vs idle live", test_idle_live_book_is_not_the_paper_account),
         ("closed live gate", test_closed_live_gate_does_not_mark_kraken_in_use),
         ("bind requires secret", test_dashboard_bind_requires_secret_off_localhost),
+        ("snapshot complete", test_snapshot_complete_requires_equity_and_trades),
+        ("state feed age", test_state_feed_age),
+        ("connection classifier", test_connection_classifier_js),
     ]
     failures = 0
     for label, check in checks:

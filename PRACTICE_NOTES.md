@@ -39,7 +39,7 @@ Leave the bind at `127.0.0.1`. From your laptop:
 ssh -L 8050:127.0.0.1:8050 user@your-vps
 ```
 
-Open `http://127.0.0.1:8050`. Binding `0.0.0.0` requires `DASHBOARD_SECRET`. When that secret is set, the page and `/api/snapshot` both require it (`?token=`, `X-Dashboard-Token`, or `Authorization: Bearer`). The server does not print the secret.
+Open `http://127.0.0.1:8050`. Binding `0.0.0.0` requires `DASHBOARD_SECRET`. When that secret is set, the page and `/api/snapshot` both require it (`?token=`, `X-Dashboard-Token`, or `Authorization: Bearer`). The server does not print the secret. The connection banner should say **LIVE / Connected**. If it says **Waiting for live data**, **STALE**, or **DISCONNECTED**, the $10,000 figure is not a live book — reconnect the tunnel or add `?token=`.
 
 ## Daily check
 
