@@ -48,35 +48,42 @@ def test_page_has_multi_pair_surfaces() -> None:
     assert 'id="mode-banner"' in PAGE
     assert 'id="conn-banner"' in PAGE
     assert 'id="conn-title"' in PAGE
-    assert "WAITING FOR LIVE DATA" in PAGE
-    assert "Waiting for live data…" in PAGE
-    assert "LIVE / Connected" in PAGE
-    assert "DISCONNECTED / Not updating" in PAGE
-    assert "DISCONNECTED / Not authorized" in PAGE
-    assert ">STALE<" in PAGE or 'title: "STALE"' in PAGE
-    assert "Numbers may be wrong" in PAGE
-    assert "Reconnect the tunnel" in PAGE
+    assert "Waiting for VPS…" in PAGE
+    assert 'title: "Live"' in PAGE
+    assert 'title: "Stale"' in PAGE
+    assert 'title: "Disconnected"' in PAGE
+    assert "Last good snapshot was" in PAGE
+    assert "Last updated" in PAGE
+    assert "Numbers below are the last good snapshot." in PAGE
     assert "?token=" in PAGE
     assert "DASHBOARD_SECRET" in PAGE
     assert "WEBHOOK_SECRET" in PAGE
     assert "The secret is not shown" in PAGE
     assert "equity or trades missing" in PAGE
+    assert "const FETCH_TIMEOUT_MS = 8000;" in PAGE
+    assert "AbortController" in PAGE
+    assert "function blankBooks()" in PAGE
+    assert "if (view.hideNumbers) blankBooks();" in PAGE
     assert f"let staleAfterSeconds = {SNAPSHOT_STALE_SECONDS};" in PAGE
     assert f"let runnerStaleAfterSeconds = {RUNNER_STALE_SECONDS};" in PAGE
     assert SNAPSHOT_STALE_SECONDS == 60
     assert RUNNER_STALE_SECONDS == 120
     html = PAGE.split("/* __CONN_JS_START__ */", 1)[0]
     equity_at = html.index('id="paper-equity"')
-    equity_snip = html[equity_at:equity_at + 160]
-    assert "Waiting for live data…" in equity_snip
+    equity_snip = html[equity_at:equity_at + 180]
+    assert ">—" in equity_snip
     assert "10,000" not in equity_snip
+    assert "10000" not in equity_snip
     assert "$10,000.00" not in html
-    assert 'data-feed="waiting"' in html
+    assert 'data-feed="disconnected"' in html
+    assert 'id="desk"' in html
     assert "connecting…" not in PAGE
     assert "poll failed:" not in PAGE
+    assert "Waiting for live data" not in PAGE
     tick = PAGE.split("async function tick()", 1)[1]
     assert tick.index("snapshotComplete") < tick.index("render(data)")
     assert "pollProblem = null" in tick
+    assert "ctrl.abort()" in tick
     print("    connection banner hides the $10k placeholder until a snapshot")
     assert 'id="paper-panel"' in PAGE
     assert 'id="live-panel"' in PAGE
@@ -487,65 +494,84 @@ function check(name, input, expect) {
   const got = classifyConnection(input);
   if (got.level !== expect.level) failures.push(name + " level " + got.level);
   if (got.title !== expect.title) failures.push(name + " title " + got.title);
+  if (expect.hideNumbers !== undefined && !!got.hideNumbers !== !!expect.hideNumbers) {
+    failures.push(name + " hideNumbers " + got.hideNumbers);
+  }
   for (const bit of expect.has || []) {
-    if (!String(got.detail).includes(bit)) failures.push(name + " missing " + bit);
+    if (!String(got.detail).includes(bit)) failures.push(name + " missing " + bit + " in " + got.detail);
   }
   for (const bit of expect.lacks || []) {
     if (String(got.detail).includes(bit) || String(got.title).includes(bit)) failures.push(name + " leaked " + bit);
   }
 }
 const base = """ + json.dumps(waiting) + """;
-check("waiting", base, {level: "waiting", title: "WAITING FOR LIVE DATA", has: ["Waiting for live data"]});
+check("waiting", base, {level: "disconnected", title: "Disconnected", hideNumbers: true, has: ["Waiting for VPS"]});
 check("unauthorized", Object.assign({}, base, {problem: "unauthorized", httpStatus: 401}), {
   level: "disconnected",
-  title: "DISCONNECTED / Not authorized",
+  title: "Disconnected",
+  hideNumbers: true,
   has: ["401", "?token=", "DASHBOARD_SECRET", "WEBHOOK_SECRET", "not shown"],
-  lacks: ["dash-secret", "super-secret-value"]
+  lacks: ["dash-secret", "super-secret-value", "10000"]
 });
 check("offline", Object.assign({}, base, {problem: "network"}), {
   level: "disconnected",
-  title: "DISCONNECTED / Not updating",
-  has: ["Numbers may be wrong", "Reconnect the tunnel", "Waiting for live data"]
+  title: "Disconnected",
+  hideNumbers: true,
+  has: ["Waiting for VPS", "Cannot reach the VPS"]
 });
-check("offline-after-load", Object.assign({}, base, {problem: "network", everLoaded: true, snapshotAgeSeconds: 12}), {
+check("offline-after-load", Object.assign({}, base, {problem: "network", everLoaded: true, snapshotAgeSeconds: 12, lastUpdatedLabel: "2026-09-25 16:00:00 UTC"}), {
   level: "disconnected",
-  title: "DISCONNECTED / Not updating",
-  has: ["Numbers may be wrong"],
-  lacks: ["Waiting for live data"]
+  title: "Disconnected",
+  hideNumbers: false,
+  has: ["Last updated 12s ago", "2026-09-25 16:00:00 UTC", "last good snapshot"],
+  lacks: ["Waiting for VPS"]
 });
-check("http", Object.assign({}, base, {problem: "http", httpStatus: 500, everLoaded: true}), {
+check("http", Object.assign({}, base, {problem: "http", httpStatus: 500, everLoaded: true, snapshotAgeSeconds: 4}), {
   level: "disconnected",
-  title: "DISCONNECTED / Not updating",
-  has: ["HTTP 500"]
+  title: "Disconnected",
+  hideNumbers: false,
+  has: ["HTTP 500", "Last updated 4s ago"]
 });
 check("timeout", Object.assign({}, base, {problem: "timeout"}), {
   level: "disconnected",
-  title: "DISCONNECTED / Not updating",
-  has: ["timed out"]
+  title: "Disconnected",
+  hideNumbers: true,
+  has: ["Waiting for VPS", "too long"]
+});
+check("timeout-after-load", Object.assign({}, base, {problem: "timeout", everLoaded: true, snapshotAgeSeconds: 9}), {
+  level: "disconnected",
+  title: "Disconnected",
+  hideNumbers: false,
+  has: ["too long", "Last updated 9s ago", "last good snapshot"]
 });
 check("incomplete", Object.assign({}, base, {problem: "incomplete", httpStatus: 200}), {
   level: "disconnected",
-  title: "DISCONNECTED / Not updating",
-  has: ["equity or trades missing"]
+  title: "Disconnected",
+  hideNumbers: true,
+  has: ["equity or trades missing", "Waiting for VPS"]
 });
 check("live", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 3, runnerPresent: true, runnerAgeSeconds: 12}), {
   level: "live",
-  title: "LIVE / Connected",
-  has: ["Updated 3s ago", "Runner state 12s old"]
+  title: "Live",
+  hideNumbers: false,
+  has: ["Updated 3s ago", "Runner file 12s old"]
 });
 check("stale-snapshot", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 61, runnerPresent: true, runnerAgeSeconds: 12}), {
   level: "stale",
-  title: "STALE",
-  has: ["too old to trust", "Numbers may be wrong"]
+  title: "Stale",
+  hideNumbers: false,
+  has: ["Last good snapshot was 1m 1s ago", "may be old"]
 });
 check("stale-runner", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 3, runnerPresent: true, runnerAgeSeconds: 121}), {
   level: "stale",
-  title: "STALE",
-  has: ["poll succeeded", "Numbers may be wrong"]
+  title: "Stale",
+  hideNumbers: false,
+  has: ["Last good snapshot was 3s ago", "runner file is 2m 1s old"]
 });
 check("recover", Object.assign({}, base, {everLoaded: true, snapshotAgeSeconds: 1, runnerPresent: true, runnerAgeSeconds: 4, problem: null}), {
   level: "live",
-  title: "LIVE / Connected",
+  title: "Live",
+  hideNumbers: false,
   has: ["Updated 1s ago"]
 });
 if (snapshotComplete(null) !== false) failures.push("null snapshot");

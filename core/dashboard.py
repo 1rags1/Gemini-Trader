@@ -956,19 +956,19 @@ PAGE = r"""<!DOCTYPE html>
   <style>
     body { font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
     .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
-    body[data-feed="waiting"] #books,
-    body[data-feed="stale"] #books,
-    body[data-feed="disconnected"] #books { opacity: 0.5; }
+    body[data-feed="stale"] #desk,
+    body[data-feed="disconnected"][data-loaded="1"] #desk { opacity: 0.45; }
     #conn-banner { position: sticky; top: 0.75rem; z-index: 30; }
   </style>
 </head>
-<body class="bg-ink text-slate-200 min-h-screen" data-feed="waiting" data-loaded="0">
+<body class="bg-ink text-slate-200 min-h-screen" data-feed="disconnected" data-loaded="0">
   <div class="max-w-6xl mx-auto px-5 py-6">
-    <section id="conn-banner" class="mb-4 rounded-xl border border-slate-500/50 bg-slate-700/40 px-4 py-3">
-      <p id="conn-title" role="status" aria-live="polite" class="text-lg sm:text-xl font-semibold tracking-wide text-slate-100">WAITING FOR LIVE DATA</p>
-      <p id="conn-detail" class="text-sm text-slate-200 mt-1">Waiting for live data… Equity stays blank until /api/snapshot succeeds. This is not a live $10,000 book.</p>
+    <section id="conn-banner" class="mb-4 rounded-xl border-2 border-rose-500 bg-rose-600/40 px-4 py-4">
+      <p id="conn-title" role="status" aria-live="polite" class="text-2xl font-semibold tracking-wide text-rose-50">Disconnected</p>
+      <p id="conn-detail" class="text-sm text-rose-50 mt-1">Waiting for VPS…</p>
     </section>
 
+    <div id="desk">
     <header class="flex flex-wrap items-end justify-between gap-3 mb-4">
       <div>
         <p class="text-xs uppercase tracking-[0.2em] text-teal-400/80">Gemini Trend Guard</p>
@@ -981,13 +981,13 @@ PAGE = r"""<!DOCTYPE html>
       <div class="text-right text-sm text-slate-400">
         <div>Updated <span id="updated" class="mono text-slate-200">—</span></div>
         <div>Next refresh in <span id="countdown" class="mono text-teal-300">10</span>s</div>
-        <div id="status" class="text-xs mt-1 text-slate-500">waiting for live data…</div>
+        <div id="status" class="text-xs mt-1 text-rose-300">Waiting for VPS…</div>
       </div>
     </header>
 
     <section id="mode-banner" class="mb-4 rounded-xl border border-white/10 bg-panel px-4 py-3">
-      <p id="mode-banner-label" class="text-lg sm:text-xl font-semibold tracking-wide text-slate-200">WAITING FOR LIVE DATA</p>
-      <p id="mode-detail" class="text-sm text-slate-400 mt-1">Waiting for live data… Mode appears after a snapshot loads.</p>
+      <p id="mode-banner-label" class="text-lg sm:text-xl font-semibold tracking-wide text-slate-200">Waiting for VPS…</p>
+      <p id="mode-detail" class="text-sm text-slate-400 mt-1">—</p>
     </section>
 
     <section id="books" class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
@@ -1000,10 +1000,10 @@ PAGE = r"""<!DOCTYPE html>
           <span id="paper-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-500/20 text-slate-300 ring-1 ring-white/10">—</span>
         </div>
         <p id="equity-label" class="text-xs uppercase tracking-wider text-slate-400 mt-4">PAPER EQUITY</p>
-        <p id="paper-equity" class="text-3xl font-semibold mt-1 mono text-slate-400">Waiting for live data…</p>
+        <p id="paper-equity" class="text-3xl font-semibold mt-1 mono text-slate-400">—</p>
         <p id="paper-pnl" class="text-sm mt-2 text-slate-400">—</p>
-        <p id="paper-note" class="text-xs text-slate-400 mt-2">Waiting for live data…</p>
-        <p id="paper-status" class="text-sm mt-3 text-slate-400">Waiting for live data…</p>
+        <p id="paper-note" class="text-xs text-slate-400 mt-2">—</p>
+        <p id="paper-status" class="text-sm mt-3 text-slate-400">—</p>
         <div id="paper-positions" class="mt-3 space-y-2"></div>
       </article>
       <article id="live-panel" class="rounded-xl border border-white/10 bg-panel p-4 opacity-60">
@@ -1015,15 +1015,17 @@ PAGE = r"""<!DOCTYPE html>
           <span id="live-use" class="inline-flex px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-500/20 text-slate-300 ring-1 ring-white/10">—</span>
         </div>
         <p id="live-equity-label" class="text-xs uppercase tracking-wider text-slate-500 mt-4">LIVE KRAKEN EQUITY</p>
-        <p id="live-equity" class="text-3xl font-semibold mt-1 mono text-slate-400">Waiting for live data…</p>
+        <p id="live-equity" class="text-3xl font-semibold mt-1 mono text-slate-400">—</p>
         <p id="live-pnl" class="text-sm mt-2 text-slate-500">—</p>
-        <p id="live-note" class="text-xs text-slate-500 mt-2">Waiting for live data…</p>
-        <p id="live-status" class="text-sm mt-3 text-slate-400">Waiting for live data…</p>
+        <p id="live-note" class="text-xs text-slate-500 mt-2">—</p>
+        <p id="live-status" class="text-sm mt-3 text-slate-400">—</p>
         <div id="live-positions" class="mt-3 space-y-2"></div>
       </article>
     </section>
 
-    <section id="pair-cards" class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4"></section>
+    <section id="pair-cards" class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+      <article class="bg-panel rounded-xl border border-white/5 p-4 md:col-span-3"><p class="text-sm text-slate-500">—</p></article>
+    </section>
 
     <section class="bg-panel rounded-xl border border-white/5 p-4 mb-4 overflow-hidden">
       <div class="flex items-baseline justify-between mb-3">
@@ -1045,7 +1047,7 @@ PAGE = r"""<!DOCTYPE html>
             </tr>
           </thead>
           <tbody id="metrics" class="divide-y divide-white/5">
-            <tr><td colspan="7" class="py-6 text-center text-slate-500">Waiting for live data…</td></tr>
+            <tr><td colspan="7" class="py-6 text-center text-slate-500">—</td></tr>
           </tbody>
         </table>
       </div>
@@ -1054,7 +1056,7 @@ PAGE = r"""<!DOCTYPE html>
     <section class="bg-panel rounded-xl border border-white/5 overflow-hidden">
       <div class="px-4 py-3 flex items-baseline justify-between border-b border-white/5">
         <h2 id="trade-heading" class="text-sm uppercase tracking-wider text-slate-400">Active book trade log</h2>
-        <p id="trade-meta" class="text-xs text-slate-500">Waiting for live data…</p>
+        <p id="trade-meta" class="text-xs text-slate-500">—</p>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
@@ -1070,20 +1072,22 @@ PAGE = r"""<!DOCTYPE html>
             </tr>
           </thead>
           <tbody id="trades" class="divide-y divide-white/5">
-            <tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">Waiting for live data…</td></tr>
+            <tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">—</td></tr>
           </tbody>
         </table>
       </div>
     </section>
+    </div>
   </div>
 
   <script>
     const POLL_MS = 10000;
-    const FETCH_TIMEOUT_MS = 25000;
+    const FETCH_TIMEOUT_MS = 8000;
     let remaining = 10;
     let inflight = false;
     let everLoaded = false;
     let lastGoodAt = null;
+    let lastGoodLabel = "";
     let pollProblem = null;
     let lastHttpStatus = null;
     let runnerPresent = false;
@@ -1124,36 +1128,60 @@ PAGE = r"""<!DOCTYPE html>
         return h + "h " + (m % 60) + "m";
       }
 
+      const clock = input.lastUpdatedLabel ? String(input.lastUpdatedLabel) : "";
+      const updatedLine = !ever
+        ? "—"
+        : (clock
+          ? ("Last updated " + clock)
+          : (age != null ? ("Last updated " + ageLabel(age) + " ago") : "—"));
+
       if (kind === "unauthorized" || httpStatus === 401) {
         return {
           level: "disconnected",
-          title: "DISCONNECTED / Not authorized",
-          detail: "The snapshot returned 401. Open this page with ?token= set to your DASHBOARD_SECRET or WEBHOOK_SECRET. Header X-Dashboard-Token or Authorization: Bearer works too. The secret is not shown here. Numbers on this page are not live.",
-          statusLine: "not authorized — open with ?token="
+          title: "Disconnected",
+          detail: "The VPS said no (401). Add ?token= to the address. Use your DASHBOARD_SECRET or WEBHOOK_SECRET. The secret is not shown here.",
+          statusLine: "Disconnected — add ?token=",
+          updatedLine: "—",
+          hideNumbers: true
         };
       }
       if (kind) {
         const why = kind === "incomplete"
-          ? "The snapshot was incomplete (equity or trades missing)."
+          ? "The VPS sent an incomplete update (equity or trades missing)."
           : kind === "timeout"
-            ? "The snapshot request timed out."
+            ? "The VPS took too long to answer."
             : kind === "http"
-              ? ("The snapshot request failed" + (httpStatus ? " (HTTP " + httpStatus + ")." : "."))
-              : "The snapshot request failed (network or tunnel down).";
+              ? ("The VPS returned an error" + (httpStatus ? " (HTTP " + httpStatus + ")." : "."))
+              : "Cannot reach the VPS.";
+        if (!ever) {
+          return {
+            level: "disconnected",
+            title: "Disconnected",
+            detail: "Waiting for VPS… " + why,
+            statusLine: "Waiting for VPS…",
+            updatedLine: "—",
+            hideNumbers: true
+          };
+        }
         return {
           level: "disconnected",
-          title: "DISCONNECTED / Not updating",
-          detail: why + " Numbers may be wrong. Reconnect the tunnel and check the token. Polling continues; the banner returns to LIVE / Connected when a good snapshot arrives."
-            + (ever ? "" : " Waiting for live data…"),
-          statusLine: "not updating"
+          title: "Disconnected",
+          detail: why + " Last updated " + ageLabel(age) + " ago"
+            + (clock ? " (" + clock + ")." : ".")
+            + " Numbers below are the last good snapshot.",
+          statusLine: "Disconnected",
+          updatedLine: updatedLine,
+          hideNumbers: false
         };
       }
       if (!ever) {
         return {
-          level: "waiting",
-          title: "WAITING FOR LIVE DATA",
-          detail: "Waiting for live data… Equity stays blank until /api/snapshot succeeds. This is not a live $10,000 book.",
-          statusLine: "waiting for live data…"
+          level: "disconnected",
+          title: "Disconnected",
+          detail: "Waiting for VPS…",
+          statusLine: "Waiting for VPS…",
+          updatedLine: "—",
+          hideNumbers: true
         };
       }
       const runnerIsPresent = !!input.runnerPresent;
@@ -1161,30 +1189,28 @@ PAGE = r"""<!DOCTYPE html>
       const runnerStale = runnerIsPresent && runnerAge != null && Number(runnerAge) > runnerStaleAfter;
       const snapshotStale = age != null && Number(age) > staleAfter;
       if (runnerStale || snapshotStale) {
-        const bits = [];
-        if (snapshotStale) bits.push("Last good snapshot is " + ageLabel(age) + " old");
-        if (runnerStale) bits.push("runner state file is " + ageLabel(runnerAge) + " old");
-        const pollNote = snapshotStale
-          ? "The book on screen is too old to trust."
-          : "The dashboard poll succeeded, but the runner state is too old to trust.";
+        let detail = "Last good snapshot was " + ageLabel(age) + " ago.";
+        if (runnerStale) detail += " The VPS runner file is " + ageLabel(runnerAge) + " old.";
+        detail += " These numbers may be old.";
         return {
           level: "stale",
-          title: "STALE",
-          detail: bits.join(" · ") + ". " + pollNote + " Numbers may be wrong.",
-          statusLine: "stale · " + ageLabel(age)
+          title: "Stale",
+          detail: detail,
+          statusLine: "Stale",
+          updatedLine: updatedLine,
+          hideNumbers: false
         };
       }
       let detail = "Updated " + ageLabel(age) + " ago.";
-      if (runnerIsPresent && runnerAge != null) {
-        detail += " Runner state " + ageLabel(runnerAge) + " old.";
-      } else {
-        detail += " No runner state file on disk yet, so practice equity is only the configured balance.";
-      }
+      if (runnerIsPresent && runnerAge != null) detail += " Runner file " + ageLabel(runnerAge) + " old.";
+      else detail += " No runner file on the VPS yet.";
       return {
         level: "live",
-        title: "LIVE / Connected",
+        title: "Live",
         detail: detail,
-        statusLine: "connected · " + ageLabel(age) + " ago"
+        statusLine: "Live",
+        updatedLine: updatedLine,
+        hideNumbers: false
       };
     }
     /* __CONN_JS_END__ */
@@ -1203,39 +1229,62 @@ PAGE = r"""<!DOCTYPE html>
         runnerPresent: runnerPresent,
         runnerAgeSeconds: runnerAge,
         staleAfterSeconds: staleAfterSeconds,
-        runnerStaleAfterSeconds: runnerStaleAfterSeconds
+        runnerStaleAfterSeconds: runnerStaleAfterSeconds,
+        lastUpdatedLabel: lastGoodLabel
       };
+    }
+
+    function blankBooks() {
+      ["paper", "live"].forEach(prefix => {
+        const equityId = prefix === "paper" ? "paper-equity" : "live-equity";
+        document.getElementById(equityId).textContent = "—";
+        document.getElementById(prefix + "-pnl").textContent = "—";
+        document.getElementById(prefix + "-note").textContent = "—";
+        document.getElementById(prefix + "-status").textContent = "—";
+        document.getElementById(prefix + "-positions").textContent = "";
+        document.getElementById(prefix + "-use").textContent = "—";
+      });
+      document.getElementById("mode-banner-label").textContent = "Waiting for VPS…";
+      document.getElementById("mode-detail").textContent = "—";
+      document.getElementById("trade-meta").textContent = "—";
+      document.getElementById("trades").innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">—</td></tr>';
+      document.getElementById("metrics").innerHTML = '<tr><td colspan="7" class="py-6 text-center text-slate-500">—</td></tr>';
+      document.getElementById("pair-cards").innerHTML = '<article class="bg-panel rounded-xl border border-white/5 p-4 md:col-span-3"><p class="text-sm text-slate-500">—</p></article>';
+      document.getElementById("desk-title").textContent = "Monitor";
+      document.body.dataset.loaded = "0";
     }
 
     function paintConnection(nowMs) {
       const view = classifyConnection(connectionInput(nowMs || Date.now()));
+      if (view.hideNumbers) blankBooks();
       document.body.dataset.feed = view.level;
       const banner = document.getElementById("conn-banner");
       const title = document.getElementById("conn-title");
       const detail = document.getElementById("conn-detail");
       const styles = {
-        live: "mb-4 rounded-xl border border-emerald-400/60 bg-emerald-500/15 px-4 py-3",
-        stale: "mb-4 rounded-xl border-2 border-amber-300 bg-amber-400/20 px-4 py-4",
-        disconnected: "mb-4 rounded-xl border-2 border-rose-400 bg-rose-600/25 px-4 py-4",
-        waiting: "mb-4 rounded-xl border border-slate-500/50 bg-slate-700/40 px-4 py-3"
+        live: "mb-4 rounded-xl border-2 border-emerald-400 bg-emerald-600/35 px-4 py-4",
+        stale: "mb-4 rounded-xl border-2 border-yellow-300 bg-yellow-400/25 px-4 py-4",
+        disconnected: "mb-4 rounded-xl border-2 border-rose-500 bg-rose-600/40 px-4 py-4"
       };
       const titleTones = {
-        live: "text-emerald-100",
-        stale: "text-amber-50",
-        disconnected: "text-rose-50",
-        waiting: "text-slate-100"
+        live: "text-emerald-50",
+        stale: "text-yellow-50",
+        disconnected: "text-rose-50"
       };
-      banner.className = styles[view.level] || styles.waiting;
-      title.className = "text-lg sm:text-2xl font-semibold tracking-wide " + (titleTones[view.level] || titleTones.waiting);
+      banner.className = styles[view.level] || styles.disconnected;
+      title.className = "text-2xl font-semibold tracking-wide " + (titleTones[view.level] || titleTones.disconnected);
       if (title.textContent !== view.title) title.textContent = view.title;
-      detail.className = "text-sm mt-1 " + (view.level === "disconnected" ? "text-rose-50" : "text-slate-100");
+      detail.className = "text-sm mt-1 " + (titleTones[view.level] || titleTones.disconnected);
       if (detail.textContent !== view.detail) detail.textContent = view.detail;
       const status = document.getElementById("status");
       status.textContent = view.statusLine;
       status.className = "text-xs mt-1 " + (
-        view.level === "live" ? "text-teal-400" :
-        view.level === "stale" ? "text-amber-300" : "text-rose-300"
+        view.level === "live" ? "text-emerald-300" :
+        view.level === "stale" ? "text-yellow-200" : "text-rose-300"
       );
+      if (view.level !== "live") {
+        document.getElementById("updated").textContent = view.updatedLine || "—";
+      }
     }
 
     const fmt = (n, d=2) => n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d});
@@ -1408,7 +1457,8 @@ PAGE = r"""<!DOCTYPE html>
         }).join("");
       }
 
-      document.getElementById("updated").textContent = (data.generated_at || "").replace("T", " ").replace("+00:00", " UTC");
+      lastGoodLabel = (data.generated_at || "").replace("T", " ").replace("+00:00", " UTC");
+      document.getElementById("updated").textContent = lastGoodLabel || "—";
     }
 
     async function tick() {
