@@ -68,6 +68,8 @@ python -m core.dashboard
 
 Open `http://127.0.0.1:8050`. The page shows two books at once. **PRACTICE / PAPER** is fake money and starts at `PAPER_STARTING_BALANCE` (default $10,000). **LIVE / KRAKEN** is the real Kraken USD balance. With the default flags the banner says **ACTIVE: PAPER TRADING**, the practice panel is marked in use, and the Kraken panel stays idle even if a last-known balance is on disk. The dashboard never sends an order.
 
+Until `/api/snapshot` succeeds, the banner is red and says **Disconnected** / **Waiting for VPS…**. Equity and the trade log stay **—**. They are not shown as $10,000. **Live** (green) means the last good snapshot is under 60 seconds old. **Stale** (yellow) means that snapshot is older than 60 seconds, or the runner file is older than 120 seconds, and the banner shows how old the last good snapshot is. **Disconnected** (red) means the poll failed. A network or timeout error keeps the last good numbers dimmed and says when they were last updated. A 401 tells you to add `?token=` (`DASHBOARD_SECRET` or `WEBHOOK_SECRET`) and clears the numbers. The page does not print the secret. A snapshot that hangs is aborted after 8 seconds. Polling continues, and a later good snapshot turns the banner Live without a refresh.
+
 The default bind is `127.0.0.1`. On a VPS, keep that bind and open it with an SSH tunnel:
 
 ```bash
