@@ -54,11 +54,23 @@ MACRO_EMA_FAST = 21
 MACRO_EMA_SLOW = 55
 MACRO_EMA_TREND = 200
 MACRO_ADX_PERIOD = 14
-MACRO_ADX_THRESHOLD = 20.0
+#: ADX at or above this is a tradable 1h trend. 16 (was 20) lets moderate
+#: trends through the macro gate. Override with MACRO_ADX_THRESHOLD.
+#: Stacked BULL still needs close > EMA 200 and EMA 21 > EMA 55. A close above
+#: EMA 200 with ADX at this threshold is SOFT_BULL even if EMA 21 is not above
+#: EMA 55, and that path may still take the 15m pullback. Strong BEAR is
+#: unchanged: close < EMA 200, EMA 21 < EMA 55, and ADX at this threshold.
+MACRO_ADX_THRESHOLD = 16.0
 MACRO_ATR_PERIOD = 14
 
-#: Friday 00:00 UTC through Sunday 20:00 UTC: no new entries (exits still run).
+#: Saturday 00:00 UTC through Sunday 12:00 UTC (~36h): no new entries.
+#: Exits still run. Weekday numbers are Monday=0 ... Sunday=6. The end is
+#: exclusive, so Sunday 12:00 UTC is tradeable again.
 WEEKEND_STAND_DOWN = True
+WEEKEND_STAND_DOWN_START_WEEKDAY = 5
+WEEKEND_STAND_DOWN_START_HOUR = 0
+WEEKEND_STAND_DOWN_END_WEEKDAY = 6
+WEEKEND_STAND_DOWN_END_HOUR = 12
 #: Used only when WEEKEND_STAND_DOWN is false.
 WEEKEND_ADX_THRESHOLD = 25.0
 
@@ -113,6 +125,10 @@ class Settings:
     macro_adx_threshold: float = MACRO_ADX_THRESHOLD
     macro_atr_period: int = MACRO_ATR_PERIOD
     weekend_stand_down: bool = WEEKEND_STAND_DOWN
+    weekend_stand_down_start_weekday: int = WEEKEND_STAND_DOWN_START_WEEKDAY
+    weekend_stand_down_start_hour: int = WEEKEND_STAND_DOWN_START_HOUR
+    weekend_stand_down_end_weekday: int = WEEKEND_STAND_DOWN_END_WEEKDAY
+    weekend_stand_down_end_hour: int = WEEKEND_STAND_DOWN_END_HOUR
     weekend_adx_threshold: float = WEEKEND_ADX_THRESHOLD
     trigger_ema_fast: int = TRIGGER_EMA_FAST
     trigger_ema_slow: int = TRIGGER_EMA_SLOW
@@ -381,6 +397,19 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, low: int, high: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < low or value > high:
+        raise ConfigError(f"{name} must be between {low} and {high}, got {value}")
+    return value
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     load_dotenv(ENV_PATH, override=False)
@@ -411,6 +440,30 @@ def get_settings() -> Settings:
         macro_adx_threshold=float(os.getenv("MACRO_ADX_THRESHOLD", str(MACRO_ADX_THRESHOLD))),
         macro_atr_period=int(os.getenv("MACRO_ATR_PERIOD", str(MACRO_ATR_PERIOD))),
         weekend_stand_down=_env_bool("WEEKEND_STAND_DOWN", WEEKEND_STAND_DOWN),
+        weekend_stand_down_start_weekday=_env_int(
+            "WEEKEND_STAND_DOWN_START_WEEKDAY",
+            WEEKEND_STAND_DOWN_START_WEEKDAY,
+            low=0,
+            high=6,
+        ),
+        weekend_stand_down_start_hour=_env_int(
+            "WEEKEND_STAND_DOWN_START_HOUR",
+            WEEKEND_STAND_DOWN_START_HOUR,
+            low=0,
+            high=23,
+        ),
+        weekend_stand_down_end_weekday=_env_int(
+            "WEEKEND_STAND_DOWN_END_WEEKDAY",
+            WEEKEND_STAND_DOWN_END_WEEKDAY,
+            low=0,
+            high=6,
+        ),
+        weekend_stand_down_end_hour=_env_int(
+            "WEEKEND_STAND_DOWN_END_HOUR",
+            WEEKEND_STAND_DOWN_END_HOUR,
+            low=0,
+            high=23,
+        ),
         weekend_adx_threshold=float(
             os.getenv("WEEKEND_ADX_THRESHOLD", str(WEEKEND_ADX_THRESHOLD))
         ),

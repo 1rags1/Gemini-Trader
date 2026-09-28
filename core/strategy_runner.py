@@ -5,10 +5,14 @@ mode is off and ALLOW_LIVE_TRADING is true. Post-only limit entries stay
 pending until the exchange reports a fill.
 
 Each cycle fetches 1h candles for the trend filter and 15m candles for the
-pullback entry. Longs only fire when the 1h regime is BULL and 15m price
-tags EMA 21 then closes back above it. Stops and targets are 1h ATR multiples.
+pullback entry. Longs fire only when the 1h regime is BULL or SOFT_BULL and
+15m price tags EMA 21 then closes back above it. SOFT_BULL means the close is
+above EMA 200 with ADX at MACRO_ADX_THRESHOLD even if EMA 21 is not above
+EMA 55. A strong BEAR (close under EMA 200, EMA 21 under EMA 55, ADX at the
+threshold) cannot open a long. Stops and targets are 1h ATR multiples.
 The ATR trail from the Pine params arms once price is 2.75x entry ATR in
-profit. Friday 00:00 UTC through Sunday 20:00 UTC takes no new entries.
+profit. Saturday 00:00 UTC through Sunday 12:00 UTC takes no new entries
+when WEEKEND_STAND_DOWN is true.
 
     python -m core.strategy_runner --once
     python -m core.strategy_runner --poll-interval 30
@@ -61,6 +65,10 @@ from core.config import (
     USE_POST_ONLY,
     WEEKEND_ADX_THRESHOLD,
     WEEKEND_STAND_DOWN,
+    WEEKEND_STAND_DOWN_END_HOUR,
+    WEEKEND_STAND_DOWN_END_WEEKDAY,
+    WEEKEND_STAND_DOWN_START_HOUR,
+    WEEKEND_STAND_DOWN_START_WEEKDAY,
     classify_book,
     dump_runner_state,
     empty_position_book,
@@ -86,6 +94,7 @@ from core.market_data import (
     add_trigger_indicators,
     classify_macro_regime,
     fetch_ohlcv,
+    regime_allows_long,
 )
 from core.paper_book import archive_json, sum_runner_closed_pnl
 from core.symbols import canonical_pairs, normalize_trading_symbol, reconcile_book, reconcile_pending
@@ -300,17 +309,39 @@ def detect_signal(closed: pd.DataFrame, params: dict[str, Any], breaker_active: 
     return None
 
 
-def weekend_session(now: pd.Timestamp | None = None) -> bool:
-    """True from Friday 00:00 UTC through Sunday 20:00 UTC."""
+def _week_minutes(stamp: pd.Timestamp) -> int:
+    """Minutes since Monday 00:00 UTC. The end hour of a window is exclusive."""
+    return int(stamp.dayofweek) * 24 * 60 + int(stamp.hour) * 60 + int(stamp.minute)
+
+
+def weekend_session(
+    now: pd.Timestamp | None = None,
+    *,
+    start_weekday: int = WEEKEND_STAND_DOWN_START_WEEKDAY,
+    start_hour: int = WEEKEND_STAND_DOWN_START_HOUR,
+    end_weekday: int = WEEKEND_STAND_DOWN_END_WEEKDAY,
+    end_hour: int = WEEKEND_STAND_DOWN_END_HOUR,
+) -> bool:
+    """True inside the stand-down window. Default is Sat 00:00 to Sun 12:00 UTC.
+
+    The window is ``[start, end)`` in UTC week-minutes (Monday=0 ... Sunday=6).
+    Sunday 12:00 is outside the default window. A start that falls after the
+    end wraps across the week boundary. A zero-length window (start == end)
+    stands down nothing.
+    """
     stamp = now if now is not None else pd.Timestamp.now(tz="UTC")
     if stamp.tzinfo is None:
         stamp = stamp.tz_localize("UTC")
     else:
         stamp = stamp.tz_convert("UTC")
-    weekday = int(stamp.dayofweek)
-    if weekday == 4 or weekday == 5:
-        return True
-    return weekday == 6 and int(stamp.hour) < 20
+    start = int(start_weekday) * 24 * 60 + int(start_hour) * 60
+    end = int(end_weekday) * 24 * 60 + int(end_hour) * 60
+    if start == end:
+        return False
+    now_m = _week_minutes(stamp)
+    if start < end:
+        return start <= now_m < end
+    return now_m >= start or now_m < end
 
 
 def detect_trigger(
@@ -360,7 +391,12 @@ def mtf_snapshot(
     trigger_bar: pd.Series,
     regime: str,
 ) -> dict[str, Any]:
-    direction = {"BULL": "long_only", "BEAR": "short_only", "NEUTRAL": "none"}.get(regime, "unknown")
+    direction = {
+        "BULL": "long_only",
+        "SOFT_BULL": "long_only",
+        "BEAR": "short_only",
+        "NEUTRAL": "none",
+    }.get(regime, "unknown")
     adx = float(macro_bar["adx"]) if _finite(macro_bar, "adx") else None
     macro_ema = float(macro_bar["ema_macro"]) if _finite(macro_bar, "ema_macro") else None
     return {
@@ -703,6 +739,10 @@ class StrategyRunner:
             self.atr_profit_mult = ATR_PROFIT_MULTIPLIER
             self.adx_threshold = MACRO_ADX_THRESHOLD
             self.weekend_stand_down = WEEKEND_STAND_DOWN
+            self.weekend_start_weekday = WEEKEND_STAND_DOWN_START_WEEKDAY
+            self.weekend_start_hour = WEEKEND_STAND_DOWN_START_HOUR
+            self.weekend_end_weekday = WEEKEND_STAND_DOWN_END_WEEKDAY
+            self.weekend_end_hour = WEEKEND_STAND_DOWN_END_HOUR
             self.weekend_adx_threshold = WEEKEND_ADX_THRESHOLD
             self.paper_trading = PAPER_TRADING if paper_trading is None else bool(paper_trading)
             self.allow_live_trading = (
@@ -722,6 +762,10 @@ class StrategyRunner:
             self.atr_profit_mult = float(self.settings.atr_profit_multiplier or ATR_PROFIT_MULTIPLIER)
             self.adx_threshold = float(self.settings.macro_adx_threshold or MACRO_ADX_THRESHOLD)
             self.weekend_stand_down = bool(self.settings.weekend_stand_down)
+            self.weekend_start_weekday = int(self.settings.weekend_stand_down_start_weekday)
+            self.weekend_start_hour = int(self.settings.weekend_stand_down_start_hour)
+            self.weekend_end_weekday = int(self.settings.weekend_stand_down_end_weekday)
+            self.weekend_end_hour = int(self.settings.weekend_stand_down_end_hour)
             self.weekend_adx_threshold = float(
                 self.settings.weekend_adx_threshold or WEEKEND_ADX_THRESHOLD
             )
@@ -1504,6 +1548,16 @@ class StrategyRunner:
             bars.append(live)
         return bars
 
+    def _in_weekend_window(self, now: pd.Timestamp | None) -> bool:
+        """Configured stand-down window. Defaults to Sat 00:00–Sun 12:00 UTC."""
+        return weekend_session(
+            now,
+            start_weekday=self.weekend_start_weekday,
+            start_hour=self.weekend_start_hour,
+            end_weekday=self.weekend_end_weekday,
+            end_hour=self.weekend_end_hour,
+        )
+
     def cycle(self, *, consult_always: bool = False, now: pd.Timestamp | None = None) -> CycleReport:
         """Evaluate every pair on 1h macro + 15m trigger, then manage the book."""
         self._resolved_entries = {}
@@ -1541,7 +1595,7 @@ class StrategyRunner:
             trigger_last = trigger_closed.iloc[-1]
             trigger_live = trigger_frame.iloc[-1]
             adx_cut = self.adx_threshold
-            if weekend_session(now) and not self.weekend_stand_down:
+            if self._in_weekend_window(now) and not self.weekend_stand_down:
                 adx_cut = max(adx_cut, self.weekend_adx_threshold)
             regime = classify_macro_regime(macro_last, adx_cut)
             snapshot = mtf_snapshot(symbol, macro_last, trigger_last, regime)
@@ -1644,14 +1698,16 @@ class StrategyRunner:
                     stop_mult=self.atr_stop_mult,
                     target_mult=self.atr_profit_mult,
                 )
-                if raw_signal is not None and item["macro_regime"] == "BULL":
+                if raw_signal is not None and regime_allows_long(item["macro_regime"]):
                     item["reason"] = "circuit_breaker_active"
                 continue
 
-            if self.weekend_stand_down and weekend_session(now):
+            # Weekend, strong bear, and chop stay distinct skip reasons.
+            # BULL and SOFT_BULL both continue into the 15m pullback.
+            if self.weekend_stand_down and self._in_weekend_window(now):
                 item["reason"] = "weekend_stand_down"
                 continue
-            if item["macro_regime"] != "BULL":
+            if not regime_allows_long(item["macro_regime"]):
                 item["reason"] = f"macro_{item['macro_regime'].lower()}"
                 continue
 
