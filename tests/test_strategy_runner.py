@@ -41,6 +41,7 @@ from core.strategy_runner import (
     position_qty,
     select_alt_entry_winner,
     update_trail,
+    weekend_session,
 )
 
 PARAMS = json.loads(
@@ -49,7 +50,11 @@ PARAMS = json.loads(
 
 START = pd.Timestamp("2026-01-01 00:00:00", tz="UTC")
 NOW = pd.Timestamp("2026-01-01 05:30:00", tz="UTC")
+FRIDAY = pd.Timestamp("2026-01-02 05:30:00", tz="UTC")
 TRIGGER_START = pd.Timestamp("2026-01-01 04:00:00", tz="UTC")
+PULLBACK_ENTRY = 10020.0
+PULLBACK_STOP = PULLBACK_ENTRY - 1.5 * 100
+PULLBACK_TARGET = PULLBACK_ENTRY + 3.5 * 100
 
 
 class StubAgent:
@@ -133,22 +138,40 @@ def macro_bear_frame() -> pd.DataFrame:
 
 
 def trigger_cross_frame() -> pd.DataFrame:
-    """Last closed 15m (05:15) is an EMA 9/21 cross-up."""
+    """Last closed 15m (05:15) tags EMA 21 and closes back above it."""
     return make_trigger_frame(
         [
-            _row(10000, 99, 100, atr=100),
-            _row(10000, 99, 100, atr=100),
-            _row(10000, 99.5, 100, atr=100),
-            _row(10000, 99.9, 100, atr=100),
-            _row(10000, 99.95, 100, atr=100),
-            _row(10000, 100.1, 100, atr=100),
-            _row(10020, 100.3, 100, atr=100),
+            _row(10040, 10030, 10000, atr=100, low=10020),
+            _row(10030, 10025, 10000, atr=100, low=10015),
+            _row(10020, 10018, 10000, atr=100, low=10008),
+            _row(10010, 10012, 10000, atr=100, low=9995),
+            _row(9998, 10008, 10000, atr=100, low=9988),
+            _row(10020, 10015, 10000, atr=100, low=9999),
+            _row(10025, 10018, 10000, atr=100, low=10010),
         ]
     )
 
 
 def trigger_flat_frame() -> pd.DataFrame:
-    return make_trigger_frame([_row(10000, 110, 100, atr=100)] * 7)
+    """Uptrend 15m structure that never tags EMA 21."""
+    return make_trigger_frame(
+        [_row(10100, 10080, 10000, atr=100, low=10050)] * 7
+    )
+
+
+def trigger_late_cross_frame() -> pd.DataFrame:
+    """EMA 9/21 cross-up without tagging EMA 21 — must not enter."""
+    return make_trigger_frame(
+        [
+            _row(10040, 9990, 10000, atr=100, low=10020),
+            _row(10040, 9990, 10000, atr=100, low=10020),
+            _row(10030, 9994, 10000, atr=100, low=10015),
+            _row(10020, 9996, 10000, atr=100, low=10010),
+            _row(10010, 9998, 10000, atr=100, low=10005),
+            _row(10020, 10010, 10000, atr=100, low=10005),
+            _row(10025, 10015, 10000, atr=100, low=10010),
+        ]
+    )
 
 
 def long_crossover_frame() -> pd.DataFrame:
@@ -256,12 +279,16 @@ def test_macro_regime_and_trigger() -> None:
 
     trigger = trigger_cross_frame()
     closed = trigger.loc[: trigger.index[5]]
-    signal = detect_trigger(closed)
+    signal = detect_trigger(closed, stop_atr=200)
     assert signal is not None and signal.action == "BUY"
-    assert abs(signal.stop - 9850) < 1e-9
-    assert abs(signal.target - 10350) < 1e-9
+    assert signal.reason == "mtf_15m_ema_pullback_long"
+    assert abs(signal.stop - (10020 - 1.5 * 200)) < 1e-9
+    assert abs(signal.target - (10020 + 3.5 * 200)) < 1e-9
     assert detect_trigger(trigger_flat_frame().loc[: trigger_flat_frame().index[5]]) is None
-    print("    BULL/BEAR/CHOP + 15m cross")
+    assert detect_trigger(trigger_late_cross_frame().loc[: trigger_late_cross_frame().index[5]]) is None
+    mixed = _row(10000, 100.5, 99.0, adx=25.0, ema_macro=11000)
+    assert classify_macro_regime(pd.Series(mixed)) == "NEUTRAL"
+    print("    BULL/BEAR/CHOP + 15m pullback")
 
 
 def test_mtf_stop_and_regime_exit() -> None:
@@ -387,8 +414,8 @@ def test_confirmed_entry_is_logged(tmp: Path | None = None) -> None:
     assert len(rows) == 1
     assert rows[0]["action"] == "BUY"
     assert rows[0]["verdict"] == "CONFIRMED"
-    assert float(rows[0]["stop_loss"]) == 9850
-    assert float(rows[0]["take_profit"]) == 10350
+    assert float(rows[0]["stop_loss"]) == PULLBACK_STOP
+    assert float(rows[0]["take_profit"]) == PULLBACK_TARGET
     print(f"    logged BUY @ {rows[0]['entry_price']}")
 
 
@@ -456,7 +483,7 @@ def test_open_position_closes_on_stop() -> None:
     assert report.position == "FLAT"
     rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
     assert rows[-1]["action"] == "CLOSE"
-    assert float(rows[-1]["entry_price"]) == 10000
+    assert float(rows[-1]["entry_price"]) == PULLBACK_ENTRY
     assert float(rows[-1]["exit_price"]) != float(rows[-1]["entry_price"])
     assert float(rows[-1]["stop_loss"]) != float(rows[-1]["entry_price"])
     assert rows[-1]["hit"] == "stop"
@@ -534,7 +561,7 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     assert eth.reason == "alt_adx_priority"
     assert eth.signal == "BUY"
     btc_qty = runner.state.positions["BTC/USD"]["qty"]
-    assert abs(btc_qty - POSITION_SIZE_FRACTION) < 1e-9
+    assert abs(btc_qty - truncate_qty(10_000 * POSITION_SIZE_FRACTION / PULLBACK_ENTRY, 8)) < 1e-12
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
     assert saved["circuit_breaker"]["tripped"] is False
     assert saved["positions"]["BTC/USD"]["status"] == "LONG"
@@ -716,6 +743,8 @@ def test_gemini_prompt_matches_mode() -> None:
     assert "Operating mode: paper trading" not in live
     assert "enforced in code" in paper and "enforced in code" in live
     assert "cannot" in paper.lower()
+    assert "1h ATR" in paper
+    assert "pullback" in paper.lower()
     print("    prompt follows paper vs live")
 
 
@@ -847,7 +876,7 @@ def test_live_entry_opens_only_after_fill() -> None:
     second = runner.cycle(now=NOW)
     assert second.position == "LONG"
     assert runner.state.pending_orders == {}
-    expected = truncate_qty(200.0 * POSITION_SIZE_FRACTION / 10000.0, 8)
+    expected = truncate_qty(200.0 * POSITION_SIZE_FRACTION / PULLBACK_ENTRY, 8)
     assert abs(runner.state.positions["BTC/USD"]["size"] - expected) < 1e-12
     rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
     assert len(rows) == 1 and rows[0]["action"] == "BUY"
@@ -1032,8 +1061,8 @@ def test_restart_resumes_open_position_without_duplicate_entry() -> None:
     assert first.state.positions["BTC/USD"]["status"] == "LONG"
     saved = json.loads((tmp / "runner.json").read_text(encoding="utf-8"))
     assert saved["positions"]["BTC/USD"]["status"] == "LONG"
-    assert saved["positions"]["BTC/USD"]["stop_loss"] == 9850
-    assert saved["positions"]["BTC/USD"]["take_profit"] == 10350
+    assert saved["positions"]["BTC/USD"]["stop_loss"] == PULLBACK_STOP
+    assert saved["positions"]["BTC/USD"]["take_profit"] == PULLBACK_TARGET
     assert "BTC/USD" in saved.get("last_bars", {})
     equity_before = saved["equity"]
 
@@ -1139,7 +1168,65 @@ def test_bear_macro_blocks_trigger() -> None:
     assert report.position == "FLAT"
     assert report.reason == "macro_bear"
     assert agent.calls == 0
-    print("    BEAR 1h blocked the 15m cross")
+    print("    BEAR 1h blocked the 15m pullback")
+
+
+def test_weekend_stand_down_skips_entry() -> None:
+    assert weekend_session(FRIDAY) is True
+    assert weekend_session(NOW) is False
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    report = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp).cycle(now=FRIDAY)
+    assert report.position == "FLAT"
+    assert report.reason == "weekend_stand_down"
+    assert agent.calls == 0
+    print("    Friday UTC stand-down skipped the pullback")
+
+
+def test_chop_does_not_flatten_long() -> None:
+    tmp = tmpdir()
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), StubAgent("BUY", 0.9), tmp)
+    opened = runner.cycle(now=NOW)
+    assert opened.position == "LONG"
+    chop = make_frame([_row(10000, 100.5, 99.0, adx=25.0, ema_macro=11000)] * 6)
+    extra = trigger_cross_frame().copy()
+    later = pd.Timestamp("2026-01-01 05:45:00", tz="UTC")
+    extra.loc[later] = _row(10025, 10018, 10000, atr=100, low=10010)
+    runner.fetch_fn = lambda *, timeframe, **_k: chop if timeframe == "1h" else extra
+    held = runner.cycle(now=later)
+    assert held.position == "LONG"
+    assert held.reason == "holding"
+    print("    strong-ADX mixed stack is chop, long held")
+
+
+def test_mtf_trail_arms_then_exits() -> None:
+    pos = Position(
+        side="LONG",
+        entry_price=10000,
+        entry_atr=100,
+        qty=1,
+        stop=9850,
+        target=10350,
+        trail_stop=9850,
+        trail_armed=False,
+        opened_bar="x",
+        confidence=0.9,
+        model="stub",
+        rationale="",
+        reason="t",
+    )
+    still_open = mtf_maybe_exit(
+        pos, high=10300, low=10200, close=10280, regime="BULL", atr=100, params=PARAMS
+    )
+    assert still_open is None
+    assert pos.trail_armed is True
+    hit = mtf_maybe_exit(
+        pos, high=10200, low=10100, close=10150, regime="BULL", atr=100, params=PARAMS
+    )
+    assert hit is not None
+    assert hit.reason == "atr_trail_long"
+    assert hit.hit == "stop"
+    print("    MTF trail armed and captured")
 
 
 def main() -> int:
@@ -1165,6 +1252,9 @@ def main() -> int:
         ("same-bar alt ADX priority", test_same_bar_alts_prefer_higher_adx),
         ("breaker blocks entry", test_breaker_blocks_entry),
         ("bear macro blocks trigger", test_bear_macro_blocks_trigger),
+        ("weekend stand-down", test_weekend_stand_down_skips_entry),
+        ("chop does not flatten", test_chop_does_not_flatten_long),
+        ("mtf trail arms", test_mtf_trail_arms_then_exits),
         ("order size clamp", test_order_size_truncates_and_clamps),
         ("below ordermin skip", test_below_ordermin_skips_entry),
         ("order classification", test_order_classification),

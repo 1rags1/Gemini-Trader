@@ -5,8 +5,10 @@ mode is off and ALLOW_LIVE_TRADING is true. Post-only limit entries stay
 pending until the exchange reports a fill.
 
 Each cycle fetches 1h candles for the trend filter and 15m candles for the
-pullback entry. Longs only fire when the 1h regime is BULL and 15m EMA 9
-crosses above EMA 21. Stops and targets are 15m ATR multiples.
+pullback entry. Longs only fire when the 1h regime is BULL and 15m price
+tags EMA 21 then closes back above it. Stops and targets are 1h ATR multiples.
+The ATR trail from the Pine params arms once price is 2.75x entry ATR in
+profit. Friday 00:00 UTC through Sunday 20:00 UTC takes no new entries.
 
     python -m core.strategy_runner --once
     python -m core.strategy_runner --poll-interval 30
@@ -57,6 +59,8 @@ from core.config import (
     TRADING_PAIRS,
     TRIGGER_TIMEFRAME,
     USE_POST_ONLY,
+    WEEKEND_ADX_THRESHOLD,
+    WEEKEND_STAND_DOWN,
     classify_book,
     dump_runner_state,
     empty_position_book,
@@ -296,30 +300,51 @@ def detect_signal(closed: pd.DataFrame, params: dict[str, Any], breaker_active: 
     return None
 
 
+def weekend_session(now: pd.Timestamp | None = None) -> bool:
+    """True from Friday 00:00 UTC through Sunday 20:00 UTC."""
+    stamp = now if now is not None else pd.Timestamp.now(tz="UTC")
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    else:
+        stamp = stamp.tz_convert("UTC")
+    weekday = int(stamp.dayofweek)
+    if weekday == 4 or weekday == 5:
+        return True
+    return weekday == 6 and int(stamp.hour) < 20
+
+
 def detect_trigger(
     closed: pd.DataFrame,
     *,
     stop_mult: float = ATR_STOP_MULTIPLIER,
     target_mult: float = ATR_PROFIT_MULTIPLIER,
+    stop_atr: float | None = None,
 ) -> Signal | None:
-    """15m EMA 9/21 cross-up on a closed bar, with close still above EMA 21."""
+    """15m pullback: tag EMA 21, close back above it, while EMA 9 stays above 21.
+
+    `stop_atr` is the 1h ATR used for the stop and target. If omitted, the 15m
+    ATR on the trigger bar is used (tests and a missing 1h row).
+    """
     if len(closed) < 2:
         return None
     prev, curr = closed.iloc[-2], closed.iloc[-1]
-    if not _finite(prev, "ema_fast", "ema_slow") or not _finite(curr, "ema_fast", "ema_slow", "close", "atr"):
+    needed = ("ema_fast", "ema_slow", "close", "low")
+    if not _finite(prev, *needed) or not _finite(curr, "ema_fast", "ema_slow", "close", "atr"):
         return None
-    crossed_up = (
-        float(prev["ema_fast"]) <= float(prev["ema_slow"])
-        and float(curr["ema_fast"]) > float(curr["ema_slow"])
-    )
-    close = float(curr["close"])
     ema21 = float(curr["ema_slow"])
-    if not (crossed_up and close > ema21):
+    if float(curr["ema_fast"]) <= ema21:
         return None
-    atr = float(curr["atr"])
+    tagged = float(prev["low"]) <= float(prev["ema_slow"])
+    reclaimed = float(curr["close"]) > ema21
+    if not (tagged and reclaimed):
+        return None
+    close = float(curr["close"])
+    atr = float(stop_atr) if stop_atr is not None and stop_atr > 0 else float(curr["atr"])
+    if atr <= 0:
+        return None
     return Signal(
         action="BUY",
-        reason="mtf_15m_ema_cross_long",
+        reason="mtf_15m_ema_pullback_long",
         price=close,
         atr=atr,
         stop=close - atr * stop_mult,
@@ -375,11 +400,18 @@ def mtf_maybe_exit(
     low: float,
     close: float,
     regime: str,
+    *,
+    atr: float | None = None,
+    params: dict[str, Any] | None = None,
 ) -> Exit | None:
-    """15m stop / target, then a BEAR flip while long."""
+    """Working stop (initial or trailed), then target, then a true BEAR flip."""
+    if params is not None and atr is not None and atr > 0:
+        update_trail(position, close, atr, params)
     if position.side == "LONG":
-        if low <= position.stop:
-            return Exit(price=position.stop, reason="atr_stop_long", hit="stop")
+        stop = position.trail_stop
+        if low <= stop:
+            reason = "atr_trail_long" if position.trail_armed else "atr_stop_long"
+            return Exit(price=stop, reason=reason, hit="stop")
         if high >= position.target:
             return Exit(price=position.target, reason="atr_target_long", hit="target")
         if regime == "BEAR":
@@ -521,6 +553,10 @@ def _position_from_dict(raw: dict[str, Any] | None) -> Position | None:
     payload.setdefault("side", status)
     payload.setdefault("entry_atr", payload.get("entry_atr") or 0.0)
     payload.setdefault("trail_armed", bool(payload.get("trail_armed") or False))
+    payload.setdefault(
+        "trail_stop",
+        payload.get("trail_stop") or payload.get("stop") or payload.get("stop_loss") or 0.0,
+    )
     payload.setdefault("opened_bar", payload.get("entry_time") or "")
     payload.setdefault("confidence", payload.get("confidence") or 0.0)
     payload.setdefault("model", payload.get("model"))
@@ -666,6 +702,8 @@ class StrategyRunner:
             self.atr_stop_mult = ATR_STOP_MULTIPLIER
             self.atr_profit_mult = ATR_PROFIT_MULTIPLIER
             self.adx_threshold = MACRO_ADX_THRESHOLD
+            self.weekend_stand_down = WEEKEND_STAND_DOWN
+            self.weekend_adx_threshold = WEEKEND_ADX_THRESHOLD
             self.paper_trading = PAPER_TRADING if paper_trading is None else bool(paper_trading)
             self.allow_live_trading = (
                 ALLOW_LIVE_TRADING if allow_live_trading is None else bool(allow_live_trading)
@@ -683,6 +721,10 @@ class StrategyRunner:
             self.atr_stop_mult = float(self.settings.atr_stop_multiplier or ATR_STOP_MULTIPLIER)
             self.atr_profit_mult = float(self.settings.atr_profit_multiplier or ATR_PROFIT_MULTIPLIER)
             self.adx_threshold = float(self.settings.macro_adx_threshold or MACRO_ADX_THRESHOLD)
+            self.weekend_stand_down = bool(self.settings.weekend_stand_down)
+            self.weekend_adx_threshold = float(
+                self.settings.weekend_adx_threshold or WEEKEND_ADX_THRESHOLD
+            )
             self.paper_trading = (
                 bool(self.settings.paper_trading) if paper_trading is None else bool(paper_trading)
             )
@@ -1342,6 +1384,28 @@ class StrategyRunner:
         )
         return str(self.trade_log)
 
+    def _persist_open_slot(self, symbol: str, position: Position, macro_regime: str) -> None:
+        slot = dict(self.state.positions.get(symbol) or {})
+        slot.update(
+            {
+                "status": position.side,
+                "side": position.side,
+                "entry_price": position.entry_price,
+                "size": position.qty,
+                "qty": position.qty,
+                "stop_loss": position.trail_stop,
+                "stop": position.trail_stop,
+                "trail_stop": position.trail_stop,
+                "trail_armed": position.trail_armed,
+                "entry_atr": position.entry_atr,
+                "take_profit": position.target,
+                "target": position.target,
+                "macro_regime": macro_regime,
+            }
+        )
+        self.state.positions[symbol] = hydrate_position_slot(slot)
+        self.state.position = legacy_open_slot(self.state.positions)
+
     def _open_position(
         self,
         symbol: str,
@@ -1476,7 +1540,10 @@ class StrategyRunner:
             macro_last = macro_closed.iloc[-1]
             trigger_last = trigger_closed.iloc[-1]
             trigger_live = trigger_frame.iloc[-1]
-            regime = classify_macro_regime(macro_last, self.adx_threshold)
+            adx_cut = self.adx_threshold
+            if weekend_session(now) and not self.weekend_stand_down:
+                adx_cut = max(adx_cut, self.weekend_adx_threshold)
+            regime = classify_macro_regime(macro_last, adx_cut)
             snapshot = mtf_snapshot(symbol, macro_last, trigger_last, regime)
             bar_iso = trigger_ts.isoformat()
             slot = self.state.positions.get(symbol) or empty_position_slot()
@@ -1511,12 +1578,19 @@ class StrategyRunner:
             exit_event = None
             exit_bar = item["live"]
             for bar in self._exit_bars(position, item["last"], item["live"]):
+                live_atr = None
+                if _finite(item["macro_last"], "atr"):
+                    live_atr = float(item["macro_last"]["atr"])
+                elif _finite(bar, "atr"):
+                    live_atr = float(bar["atr"])
                 exit_event = mtf_maybe_exit(
                     position,
                     high=float(bar["high"]),
                     low=float(bar["low"]),
                     close=float(bar["close"]),
                     regime=item["macro_regime"],
+                    atr=live_atr,
+                    params=self.params,
                 )
                 if exit_event is not None:
                     exit_bar = bar
@@ -1539,6 +1613,7 @@ class StrategyRunner:
                 item["reason"] = exit_event.reason
             else:
                 item["reason"] = "holding"
+                self._persist_open_slot(item["symbol"], position, item["macro_regime"])
 
         any_new_bar = any(item["new_bar"] for item in prepared)
         trend_strong = any(item["trend_strong"] for item in prepared)
@@ -1573,14 +1648,21 @@ class StrategyRunner:
                     item["reason"] = "circuit_breaker_active"
                 continue
 
+            if self.weekend_stand_down and weekend_session(now):
+                item["reason"] = "weekend_stand_down"
+                continue
             if item["macro_regime"] != "BULL":
                 item["reason"] = f"macro_{item['macro_regime'].lower()}"
                 continue
 
+            macro_atr = (
+                float(item["macro_last"]["atr"]) if _finite(item["macro_last"], "atr") else None
+            )
             signal = detect_trigger(
                 item["closed"],
                 stop_mult=self.atr_stop_mult,
                 target_mult=self.atr_profit_mult,
+                stop_atr=macro_atr,
             )
             item["signal"] = signal
             if signal is not None:

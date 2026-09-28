@@ -55,6 +55,12 @@ MACRO_EMA_SLOW = 55
 MACRO_EMA_TREND = 200
 MACRO_ADX_PERIOD = 14
 MACRO_ADX_THRESHOLD = 20.0
+MACRO_ATR_PERIOD = 14
+
+#: Friday 00:00 UTC through Sunday 20:00 UTC: no new entries (exits still run).
+WEEKEND_STAND_DOWN = True
+#: Used only when WEEKEND_STAND_DOWN is false.
+WEEKEND_ADX_THRESHOLD = 25.0
 
 #: Trigger (15m) pullback / ATR risk.
 TRIGGER_EMA_FAST = 9
@@ -69,7 +75,7 @@ MAX_OPEN_POSITIONS = 2
 #: rest as a cash buffer for fees and slippage.
 POSITION_SIZE_FRACTION = 0.25
 
-#: 15m ATR multiples. 1.5 / 3.5 is about 1 : 2.33 risk-to-reward.
+#: Stop and target multiples of the 1h ATR. 1.5 / 3.5 is about 1 : 2.33.
 ATR_STOP_MULTIPLIER = 1.5
 ATR_PROFIT_MULTIPLIER = 3.5
 
@@ -105,6 +111,9 @@ class Settings:
     macro_ema_trend: int = MACRO_EMA_TREND
     macro_adx_period: int = MACRO_ADX_PERIOD
     macro_adx_threshold: float = MACRO_ADX_THRESHOLD
+    macro_atr_period: int = MACRO_ATR_PERIOD
+    weekend_stand_down: bool = WEEKEND_STAND_DOWN
+    weekend_adx_threshold: float = WEEKEND_ADX_THRESHOLD
     trigger_ema_fast: int = TRIGGER_EMA_FAST
     trigger_ema_slow: int = TRIGGER_EMA_SLOW
     trigger_atr_period: int = TRIGGER_ATR_PERIOD
@@ -157,6 +166,8 @@ def empty_position_slot(macro_regime: str = "UNKNOWN") -> dict[str, Any]:
         "take_profit": 0.0,
         "entry_time": None,
         "macro_regime": str(macro_regime or "UNKNOWN").upper(),
+        "entry_atr": 0.0,
+        "trail_armed": False,
     }
 
 
@@ -194,6 +205,8 @@ def canonical_position_slot(slot: dict[str, Any] | None) -> dict[str, Any]:
         "take_profit": _as_float(target),
         "entry_time": entry_time or None,
         "macro_regime": str(slot.get("macro_regime") or ("BULL" if status == "LONG" else "BEAR")).upper(),
+        "entry_atr": _as_float(slot.get("entry_atr", slot.get("atr", 0.0))),
+        "trail_armed": bool(slot.get("trail_armed") or False),
     }
 
 
@@ -396,6 +409,11 @@ def get_settings() -> Settings:
         macro_ema_trend=int(os.getenv("MACRO_EMA_TREND", str(MACRO_EMA_TREND))),
         macro_adx_period=int(os.getenv("MACRO_ADX_PERIOD", str(MACRO_ADX_PERIOD))),
         macro_adx_threshold=float(os.getenv("MACRO_ADX_THRESHOLD", str(MACRO_ADX_THRESHOLD))),
+        macro_atr_period=int(os.getenv("MACRO_ATR_PERIOD", str(MACRO_ATR_PERIOD))),
+        weekend_stand_down=_env_bool("WEEKEND_STAND_DOWN", WEEKEND_STAND_DOWN),
+        weekend_adx_threshold=float(
+            os.getenv("WEEKEND_ADX_THRESHOLD", str(WEEKEND_ADX_THRESHOLD))
+        ),
         trigger_ema_fast=int(os.getenv("TRIGGER_EMA_FAST", str(TRIGGER_EMA_FAST))),
         trigger_ema_slow=int(os.getenv("TRIGGER_EMA_SLOW", str(TRIGGER_EMA_SLOW))),
         trigger_atr_period=int(os.getenv("TRIGGER_ATR_PERIOD", str(TRIGGER_ATR_PERIOD))),
