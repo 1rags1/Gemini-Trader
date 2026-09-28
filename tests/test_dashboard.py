@@ -365,6 +365,30 @@ def test_dashboard_bind_requires_secret_off_localhost() -> None:
         get_settings.cache_clear()
 
 
+def test_dashboard_public_flag_skips_token() -> None:
+    import os
+
+    from core.config import get_settings
+    from core.dashboard import check_token, dashboard_public
+
+    class Req:
+        def __init__(self, host: str) -> None:
+            self.client = type("C", (), {"host": host})()
+            self.headers = {}
+
+    os.environ["DASHBOARD_SECRET"] = "dash-secret"
+    os.environ["DASHBOARD_PUBLIC"] = "true"
+    get_settings.cache_clear()
+    try:
+        assert dashboard_public() is True
+        check_token(Req("203.0.113.10"), None)
+        print("    DASHBOARD_PUBLIC=true serves remote clients without a token")
+    finally:
+        os.environ.pop("DASHBOARD_SECRET", None)
+        os.environ.pop("DASHBOARD_PUBLIC", None)
+        get_settings.cache_clear()
+
+
 def main() -> int:
     checks = [
         ("page surfaces", test_page_has_multi_pair_surfaces),
@@ -375,6 +399,7 @@ def main() -> int:
         ("paper vs idle live", test_idle_live_book_is_not_the_paper_account),
         ("closed live gate", test_closed_live_gate_does_not_mark_kraken_in_use),
         ("bind requires secret", test_dashboard_bind_requires_secret_off_localhost),
+        ("public flag skips token", test_dashboard_public_flag_skips_token),
     ]
     failures = 0
     for label, check in checks:

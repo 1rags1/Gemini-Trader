@@ -153,6 +153,12 @@ def dashboard_secret() -> str:
     return (os.getenv("DASHBOARD_SECRET") or os.getenv("WEBHOOK_SECRET") or "").strip()
 
 
+def dashboard_public() -> bool:
+    """DASHBOARD_PUBLIC=true serves the read-only page to anyone, no token."""
+    _cfg()  # load .env before reading the flag
+    return os.getenv("DASHBOARD_PUBLIC", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _header_value(headers: Any, name: str) -> str:
     if headers is None or not hasattr(headers, "get"):
         return ""
@@ -184,7 +190,10 @@ def check_token(request: Request, token: str | None) -> None:
 
     With no secret, only a direct localhost client may read the page. A public
     bind is refused at startup. The secret value is never copied into the response.
+    DASHBOARD_PUBLIC=true skips the check entirely.
     """
+    if dashboard_public():
+        return
     secret = dashboard_secret()
     presented = presented_token(request, token)
     if secret:
@@ -1224,11 +1233,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT)
     args = parser.parse_args(argv)
     _cfg()  # load .env so DASHBOARD_HOST / secrets are visible
-    host = args.host or os.getenv("DASHBOARD_HOST") or DASHBOARD_HOST
+    public = dashboard_public()
+    host = args.host or os.getenv("DASHBOARD_HOST") or ("0.0.0.0" if public else DASHBOARD_HOST)
 
     import uvicorn
 
     enable_os_trust_store()
+    if public:
+        print(f"Dashboard on http://{host}:{args.port}  (read-only, PUBLIC: no token, DASHBOARD_PUBLIC=true)")
+        uvicorn.run(app, host=host, port=args.port, log_level="info")
+        return 0
     secret = dashboard_secret()
     try:
         assert_secret_for_public_bind(
