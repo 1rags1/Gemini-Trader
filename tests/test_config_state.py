@@ -46,6 +46,10 @@ def test_mtf_defaults() -> None:
     assert MACRO_EMA_SLOW == 55
     assert MACRO_EMA_TREND == 200
     assert MACRO_ADX_THRESHOLD == 20.0
+    from core.config import WEEKEND_ADX_THRESHOLD, WEEKEND_STAND_DOWN
+
+    assert WEEKEND_STAND_DOWN is True
+    assert WEEKEND_ADX_THRESHOLD == 25.0
     assert TRIGGER_EMA_FAST == 9
     assert TRIGGER_EMA_SLOW == 21
     assert MAX_OPEN_POSITIONS == 2
@@ -90,6 +94,8 @@ def test_empty_book_schema() -> None:
             "take_profit": 0.0,
             "entry_time": None,
             "macro_regime": "UNKNOWN",
+            "entry_atr": 0.0,
+            "trail_armed": False,
         }
     print("    empty book slots")
 
@@ -149,6 +155,8 @@ def test_dump_canonical_state() -> None:
         "take_profit": 2800.0,
         "entry_time": "bar-1",
         "macro_regime": "BULL",
+        "entry_atr": 0.0,
+        "trail_armed": False,
     }
     assert payload["circuit_breaker"] == {"loss_streak": 0, "tripped": False, "cooldown_bars": 0}
     assert "qty" not in eth
@@ -177,6 +185,8 @@ def test_on_disk_runner_json() -> None:
             "take_profit",
             "entry_time",
             "macro_regime",
+            "entry_atr",
+            "trail_armed",
         }
         print(f"    {symbol} {canonical['status']}")
 

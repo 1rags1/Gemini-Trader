@@ -11,6 +11,7 @@ import pandas as pd
 from core.config import (
     MACRO_ADX_PERIOD,
     MACRO_ADX_THRESHOLD,
+    MACRO_ATR_PERIOD,
     MACRO_EMA_FAST,
     MACRO_EMA_SLOW,
     MACRO_EMA_TREND,
@@ -107,13 +108,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_macro_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """1h trend filter: EMA 21/55/200 and ADX 14."""
+    """1h trend filter: EMA 21/55/200, ADX 14, and ATR 14 for stop distance."""
     import pandas_ta as ta  # noqa: F401
 
     out = df.copy()
     out["ema_fast"] = ta.ema(out["close"], length=MACRO_EMA_FAST)
     out["ema_slow"] = ta.ema(out["close"], length=MACRO_EMA_SLOW)
     out["ema_macro"] = ta.ema(out["close"], length=MACRO_EMA_TREND)
+    out["atr"] = ta.atr(out["high"], out["low"], out["close"], length=MACRO_ATR_PERIOD)
     adx = ta.adx(out["high"], out["low"], out["close"], length=MACRO_ADX_PERIOD)
     if adx is not None:
         out["adx"] = adx[f"ADX_{MACRO_ADX_PERIOD}"]
@@ -136,9 +138,11 @@ def add_trigger_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def classify_macro_regime(bar: pd.Series, adx_threshold: float = MACRO_ADX_THRESHOLD) -> str:
-    """BULL only when 1h close > EMA 200, EMA 21 > EMA 55, and ADX is strong.
+    """BULL and BEAR are stacked 1h trends. Anything else is NEUTRAL (chop).
 
-    Otherwise NEUTRAL (weak ADX / incomplete indicators) or BEAR.
+    BULL: close > EMA 200, EMA 21 > EMA 55, ADX strong.
+    BEAR: close < EMA 200, EMA 21 < EMA 55, ADX strong.
+    A strong-ADX pullback that is not stacked is chop, not a flatten signal.
     """
     needed = ("close", "ema_fast", "ema_slow", "ema_macro", "adx")
     if any(name not in bar.index or pd.isna(bar[name]) for name in needed):
@@ -148,11 +152,13 @@ def classify_macro_regime(bar: pd.Series, adx_threshold: float = MACRO_ADX_THRES
     ema55 = float(bar["ema_slow"])
     ema200 = float(bar["ema_macro"])
     adx = float(bar["adx"])
-    if close > ema200 and ema21 > ema55 and adx >= adx_threshold:
-        return "BULL"
     if adx < adx_threshold:
         return "NEUTRAL"
-    return "BEAR"
+    if close > ema200 and ema21 > ema55:
+        return "BULL"
+    if close < ema200 and ema21 < ema55:
+        return "BEAR"
+    return "NEUTRAL"
 
 
 def _regime(last: pd.Series, adx_min: float) -> dict:

@@ -27,6 +27,8 @@ from core.symbols import canonical_pairs, normalize_trading_symbol, reconcile_bo
 from core.trade_log import TRADE_LOG_FIELDS, append_row, iter_rows  # noqa: E402
 from test_strategy_runner import (  # noqa: E402
     NOW,
+    PULLBACK_STOP,
+    PULLBACK_TARGET,
     StubAgent,
     macro_bear_frame,
     macro_bull_frame,
@@ -137,8 +139,8 @@ def test_ghost_usdt_moves_onto_usd_and_can_close() -> None:
     assert close["symbol"] == "ETH/USD"
     assert float(close["entry_price"]) == 2500
     assert float(close["exit_price"]) != float(close["entry_price"])
-    assert float(close["stop_loss"]) == 1
     assert float(close["stop_loss"]) != float(close["entry_price"])
+    assert close["hit"] == "regime"
     assert close["exit_price"]
     assert "exit_price" in close
     assert runner.state.equity != 10_000
@@ -356,9 +358,9 @@ def test_gemini_reject_unavailable_and_ignored_stop() -> None:
     )
     report = runner.cycle(now=NOW)
     assert report.position == "LONG"
-    assert runner.state.positions["BTC/USD"]["stop_loss"] == 9850
-    assert runner.state.positions["BTC/USD"]["take_profit"] == 10350
-    print("    REJECT and 503 fail closed; Gemini stop does not replace 9850")
+    assert runner.state.positions["BTC/USD"]["stop_loss"] == PULLBACK_STOP
+    assert runner.state.positions["BTC/USD"]["take_profit"] == PULLBACK_TARGET
+    print("    REJECT and 503 fail closed; Gemini stop does not replace 1h ATR bracket")
 
 
 def test_practice_summary_is_readable() -> None:
