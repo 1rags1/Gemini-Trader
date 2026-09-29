@@ -51,6 +51,12 @@ PARAMS = json.loads(
 START = pd.Timestamp("2026-01-01 00:00:00", tz="UTC")
 NOW = pd.Timestamp("2026-01-01 05:30:00", tz="UTC")
 FRIDAY = pd.Timestamp("2026-01-02 05:30:00", tz="UTC")
+FRIDAY_OPEN = pd.Timestamp("2026-01-02 00:00:00", tz="UTC")
+SATURDAY_OPEN = pd.Timestamp("2026-01-03 00:00:00", tz="UTC")
+SATURDAY = pd.Timestamp("2026-01-03 06:00:00", tz="UTC")
+SUNDAY_MORNING = pd.Timestamp("2026-01-04 11:59:00", tz="UTC")
+SUNDAY_NOON = pd.Timestamp("2026-01-04 12:00:00", tz="UTC")
+SUNDAY_EVENING = pd.Timestamp("2026-01-04 20:00:00", tz="UTC")
 TRIGGER_START = pd.Timestamp("2026-01-01 04:00:00", tz="UTC")
 PULLBACK_ENTRY = 10020.0
 PULLBACK_STOP = PULLBACK_ENTRY - 1.5 * 100
@@ -132,9 +138,15 @@ def macro_bull_frame(*, adx: float = 25.0) -> pd.DataFrame:
     return make_frame([bull] * 6)
 
 
-def macro_bear_frame() -> pd.DataFrame:
-    bear = _row(10000, 99.0, 100.5, adx=25.0, ema_macro=11000)
+def macro_bear_frame(*, adx: float = 25.0) -> pd.DataFrame:
+    bear = _row(10000, 99.0, 100.5, adx=adx, ema_macro=11000)
     return make_frame([bear] * 6)
+
+
+def macro_soft_bull_frame(*, adx: float = 18.0) -> pd.DataFrame:
+    """Close above EMA 200 while EMA 21 is still under EMA 55."""
+    soft = _row(10000, 99.0, 100.5, adx=adx, ema_macro=9000)
+    return make_frame([soft] * 6)
 
 
 def trigger_cross_frame() -> pd.DataFrame:
@@ -288,7 +300,16 @@ def test_macro_regime_and_trigger() -> None:
     assert detect_trigger(trigger_late_cross_frame().loc[: trigger_late_cross_frame().index[5]]) is None
     mixed = _row(10000, 100.5, 99.0, adx=25.0, ema_macro=11000)
     assert classify_macro_regime(pd.Series(mixed)) == "NEUTRAL"
-    print("    BULL/BEAR/CHOP + 15m pullback")
+    assert classify_macro_regime(macro_bull_frame(adx=16.0).iloc[-2]) == "BULL"
+    assert classify_macro_regime(macro_bull_frame(adx=15.99).iloc[-2]) == "NEUTRAL"
+    soft = macro_soft_bull_frame().iloc[-2]
+    assert float(soft["close"]) > float(soft["ema_macro"])
+    assert float(soft["ema_fast"]) < float(soft["ema_slow"])
+    assert classify_macro_regime(soft) == "SOFT_BULL"
+    assert classify_macro_regime(macro_soft_bull_frame(adx=15.0).iloc[-2]) == "NEUTRAL"
+    assert classify_macro_regime(macro_bear_frame(adx=16.0).iloc[-2]) == "BEAR"
+    assert classify_macro_regime(macro_bear_frame(adx=15.99).iloc[-2]) == "NEUTRAL"
+    print("    BULL/SOFT_BULL/BEAR/CHOP + 15m pullback")
 
 
 def test_mtf_stop_and_regime_exit() -> None:
@@ -622,8 +643,8 @@ def test_alt_correlation_blocks_second_alt() -> None:
 def test_same_bar_alts_prefer_higher_adx() -> None:
     tmp = tmpdir()
     agent = StubAgent("BUY", 0.9)
-    # Flat BTC frame so only alts compete for a single open slot.
-    flat_btc = make_frame([_row(10000, 110, 100, adx=18, ema_macro=9000)] * 6)
+    # ADX under the 16 threshold so BTC stays NEUTRAL and only alts compete.
+    flat_btc = make_frame([_row(10000, 110, 100, adx=12, ema_macro=9000)] * 6)
     macros = {
         "BTC/USD": flat_btc,
         "ETH/USD": macro_bull_frame(adx=22),
@@ -1171,16 +1192,146 @@ def test_bear_macro_blocks_trigger() -> None:
     print("    BEAR 1h blocked the 15m pullback")
 
 
-def test_weekend_stand_down_skips_entry() -> None:
-    assert weekend_session(FRIDAY) is True
+def test_weekend_window_is_saturday_through_sunday_noon() -> None:
+    assert weekend_session(FRIDAY_OPEN) is False
+    assert weekend_session(FRIDAY) is False
+    assert weekend_session(SATURDAY_OPEN) is True
+    assert weekend_session(SATURDAY) is True
+    assert weekend_session(SUNDAY_MORNING) is True
+    assert weekend_session(SUNDAY_NOON) is False
+    assert weekend_session(SUNDAY_EVENING) is False
     assert weekend_session(NOW) is False
+    # The previous Fri 00:00–Sun 20:00 window is still expressible with the knobs.
+    assert weekend_session(
+        FRIDAY_OPEN,
+        start_weekday=4,
+        start_hour=0,
+        end_weekday=6,
+        end_hour=20,
+    ) is True
+    assert weekend_session(
+        FRIDAY_OPEN,
+        start_weekday=5,
+        start_hour=0,
+        end_weekday=5,
+        end_hour=0,
+    ) is False
+    print("    stand-down is Sat 00:00 through Sun 12:00 UTC")
+
+
+def test_weekend_stand_down_skips_entry() -> None:
     tmp = tmpdir()
     agent = StubAgent("BUY", 0.9)
-    report = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp).cycle(now=FRIDAY)
+    report = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp).cycle(now=SATURDAY)
     assert report.position == "FLAT"
     assert report.reason == "weekend_stand_down"
+    assert report.macro_regime == "BULL"
     assert agent.calls == 0
-    print("    Friday UTC stand-down skipped the pullback")
+    morning = runner_for(
+        macro_bull_frame(), trigger_cross_frame(), StubAgent("BUY", 0.9), tmpdir()
+    ).cycle(now=SUNDAY_MORNING)
+    assert morning.reason == "weekend_stand_down"
+    print("    Saturday and Sunday morning stand-down skipped the pullback")
+
+
+def test_friday_outside_stand_down_can_enter() -> None:
+    agent = StubAgent("BUY", 0.9)
+    report = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmpdir()).cycle(now=FRIDAY)
+    assert report.reason != "weekend_stand_down"
+    assert report.position == "LONG"
+    assert report.signal_reason == "mtf_15m_ema_pullback_long"
+    assert agent.calls == 1
+    print("    Friday UTC is outside the stand-down and can enter")
+
+
+def test_weekend_stand_down_off_allows_entry() -> None:
+    tmp = tmpdir()
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), agent, tmp)
+    runner.weekend_stand_down = False
+    report = runner.cycle(now=SATURDAY)
+    assert report.reason != "weekend_stand_down"
+    assert report.position == "LONG"
+    assert report.signal_reason == "mtf_15m_ema_pullback_long"
+    assert agent.calls == 1
+    print("    WEEKEND_STAND_DOWN off allows the Saturday pullback")
+
+
+def test_lower_adx_bull_allows_pullback() -> None:
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_bull_frame(adx=16.0), trigger_cross_frame(), agent, tmpdir())
+    report = runner.cycle(now=NOW)
+    assert report.macro_regime == "BULL"
+    assert report.position == "LONG"
+    assert report.signal_reason == "mtf_15m_ema_pullback_long"
+    assert agent.calls == 1
+    slot = runner.state.positions["BTC/USD"]
+    assert abs(float(slot["entry_price"]) - PULLBACK_ENTRY) < 1e-9
+    assert abs(float(slot["stop_loss"]) - PULLBACK_STOP) < 1e-6
+    assert abs(float(slot["take_profit"]) - PULLBACK_TARGET) < 1e-6
+    blocked_agent = StubAgent("BUY", 0.9)
+    blocked = runner_for(
+        macro_bull_frame(adx=15.99), trigger_cross_frame(), blocked_agent, tmpdir()
+    ).cycle(now=NOW)
+    assert blocked.macro_regime == "NEUTRAL"
+    assert blocked.reason == "macro_neutral"
+    assert blocked.position == "FLAT"
+    assert blocked_agent.calls == 0
+    print("    ADX 16 stacked bull enters; ADX 15.99 stays neutral")
+
+
+def test_soft_bull_above_ema200_allows_pullback() -> None:
+    agent = StubAgent("BUY", 0.9)
+    runner = runner_for(macro_soft_bull_frame(), trigger_cross_frame(), agent, tmpdir())
+    report = runner.cycle(now=NOW)
+    assert report.macro_regime == "SOFT_BULL"
+    assert report.regime["macro_trend"] == "soft_bull"
+    assert report.regime["tradeable_direction"] == "long_only"
+    assert report.signal_reason == "mtf_15m_ema_pullback_long"
+    assert report.position == "LONG"
+    assert agent.calls == 1
+    slot = runner.state.positions["BTC/USD"]
+    assert abs(float(slot["entry_price"]) - PULLBACK_ENTRY) < 1e-9
+    assert abs(float(slot["stop_loss"]) - PULLBACK_STOP) < 1e-6
+    assert abs(float(slot["take_profit"]) - PULLBACK_TARGET) < 1e-6
+    print("    soft bull above EMA200 uses the 15m pullback")
+
+
+def test_strong_bear_still_blocks_long() -> None:
+    agent = StubAgent("BUY", 0.9)
+    report = runner_for(
+        macro_bear_frame(adx=16.0), trigger_cross_frame(), agent, tmpdir()
+    ).cycle(now=NOW)
+    assert report.macro_regime == "BEAR"
+    assert report.reason == "macro_bear"
+    assert report.position == "FLAT"
+    assert report.signal is None
+    assert agent.calls == 0
+    print("    strong bear at ADX 16 still blocks the pullback")
+
+
+def test_skip_reasons_stay_distinct() -> None:
+    bear = runner_for(
+        macro_bear_frame(), trigger_cross_frame(), StubAgent("BUY", 0.9), tmpdir()
+    ).cycle(now=NOW)
+    neutral = runner_for(
+        make_frame([_row(10000, 100.5, 99.0, adx=25.0, ema_macro=11000)] * 6),
+        trigger_cross_frame(),
+        StubAgent("BUY", 0.9),
+        tmpdir(),
+    ).cycle(now=NOW)
+    quiet = runner_for(
+        macro_bull_frame(), trigger_flat_frame(), StubAgent("BUY", 0.9), tmpdir()
+    ).cycle(now=NOW)
+    stood_down = runner_for(
+        macro_bull_frame(), trigger_cross_frame(), StubAgent("BUY", 0.9), tmpdir()
+    ).cycle(now=SATURDAY)
+    assert bear.reason == "macro_bear"
+    assert neutral.reason == "macro_neutral"
+    assert quiet.reason == "flat_no_signal"
+    assert stood_down.reason == "weekend_stand_down"
+    assert len({bear.reason, neutral.reason, quiet.reason, stood_down.reason}) == 4
+    print("    skip reasons stay macro_bear / macro_neutral / flat_no_signal / weekend")
 
 
 def test_chop_does_not_flatten_long() -> None:
@@ -1252,7 +1403,14 @@ def main() -> int:
         ("same-bar alt ADX priority", test_same_bar_alts_prefer_higher_adx),
         ("breaker blocks entry", test_breaker_blocks_entry),
         ("bear macro blocks trigger", test_bear_macro_blocks_trigger),
+        ("weekend window", test_weekend_window_is_saturday_through_sunday_noon),
         ("weekend stand-down", test_weekend_stand_down_skips_entry),
+        ("Friday outside stand-down", test_friday_outside_stand_down_can_enter),
+        ("stand-down off", test_weekend_stand_down_off_allows_entry),
+        ("lower ADX bull", test_lower_adx_bull_allows_pullback),
+        ("soft bull above EMA200", test_soft_bull_above_ema200_allows_pullback),
+        ("strong bear still blocks", test_strong_bear_still_blocks_long),
+        ("skip reasons stay distinct", test_skip_reasons_stay_distinct),
         ("chop does not flatten", test_chop_does_not_flatten_long),
         ("mtf trail arms", test_mtf_trail_arms_then_exits),
         ("order size clamp", test_order_size_truncates_and_clamps),

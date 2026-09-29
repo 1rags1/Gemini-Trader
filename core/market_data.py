@@ -137,12 +137,36 @@ def add_trigger_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def classify_macro_regime(bar: pd.Series, adx_threshold: float = MACRO_ADX_THRESHOLD) -> str:
-    """BULL and BEAR are stacked 1h trends. Anything else is NEUTRAL (chop).
+#: Regimes that may open a long through the existing 15m pullback. SOFT_BULL
+#: is the paper-frequency path: price is above EMA 200 and ADX cleared the
+#: threshold, but EMA 21 is not above EMA 55. It is not a blind cross and it
+#: is not a strong bear.
+LONG_REGIMES = frozenset({"BULL", "SOFT_BULL"})
 
-    BULL: close > EMA 200, EMA 21 > EMA 55, ADX strong.
-    BEAR: close < EMA 200, EMA 21 < EMA 55, ADX strong.
-    A strong-ADX pullback that is not stacked is chop, not a flatten signal.
+
+def regime_allows_long(regime: str) -> bool:
+    """True when the 15m pullback may be considered for a new long."""
+    return str(regime) in LONG_REGIMES
+
+
+def classify_macro_regime(bar: pd.Series, adx_threshold: float = MACRO_ADX_THRESHOLD) -> str:
+    """Classify one closed 1h bar as BULL, SOFT_BULL, BEAR, or NEUTRAL.
+
+    ADX below ``adx_threshold`` (default 16) is chop, whatever the EMAs say.
+
+    BULL: close > EMA 200, EMA 21 > EMA 55, and ADX at the threshold. This is
+    the stacked trend. ADX from 16 up to (not including) 20 used to be NEUTRAL.
+
+    SOFT_BULL: close > EMA 200 and ADX at the threshold, even when EMA 21 is
+    not above EMA 55. Longs may still use the 15m pullback (tag EMA 21, close
+    back above it). This is not a new entry style and it does not flatten an
+    open long.
+
+    BEAR: close < EMA 200, EMA 21 < EMA 55, and ADX at the threshold. A strong
+    bear cannot open a long. Weaker ADX under EMA 200 stays NEUTRAL.
+
+    NEUTRAL: weak ADX, or a mixed stack (price below EMA 200 while EMA 21 is
+    still above EMA 55). NEUTRAL does not force an entry and does not flatten.
     """
     needed = ("close", "ema_fast", "ema_slow", "ema_macro", "adx")
     if any(name not in bar.index or pd.isna(bar[name]) for name in needed):
@@ -156,6 +180,8 @@ def classify_macro_regime(bar: pd.Series, adx_threshold: float = MACRO_ADX_THRES
         return "NEUTRAL"
     if close > ema200 and ema21 > ema55:
         return "BULL"
+    if close > ema200:
+        return "SOFT_BULL"
     if close < ema200 and ema21 < ema55:
         return "BEAR"
     return "NEUTRAL"

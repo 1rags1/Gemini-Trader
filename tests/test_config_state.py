@@ -14,6 +14,11 @@ from core.config import (
     ATR_PROFIT_MULTIPLIER,
     ATR_STOP_MULTIPLIER,
     MACRO_ADX_THRESHOLD,
+    WEEKEND_STAND_DOWN,
+    WEEKEND_STAND_DOWN_END_HOUR,
+    WEEKEND_STAND_DOWN_END_WEEKDAY,
+    WEEKEND_STAND_DOWN_START_HOUR,
+    WEEKEND_STAND_DOWN_START_WEEKDAY,
     MACRO_EMA_FAST,
     MACRO_EMA_SLOW,
     MACRO_EMA_TREND,
@@ -45,10 +50,14 @@ def test_mtf_defaults() -> None:
     assert MACRO_EMA_FAST == 21
     assert MACRO_EMA_SLOW == 55
     assert MACRO_EMA_TREND == 200
-    assert MACRO_ADX_THRESHOLD == 20.0
-    from core.config import WEEKEND_ADX_THRESHOLD, WEEKEND_STAND_DOWN
+    assert MACRO_ADX_THRESHOLD == 16.0
+    from core.config import WEEKEND_ADX_THRESHOLD
 
     assert WEEKEND_STAND_DOWN is True
+    assert WEEKEND_STAND_DOWN_START_WEEKDAY == 5
+    assert WEEKEND_STAND_DOWN_START_HOUR == 0
+    assert WEEKEND_STAND_DOWN_END_WEEKDAY == 6
+    assert WEEKEND_STAND_DOWN_END_HOUR == 12
     assert WEEKEND_ADX_THRESHOLD == 25.0
     assert TRIGGER_EMA_FAST == 9
     assert TRIGGER_EMA_SLOW == 21
@@ -61,6 +70,47 @@ def test_mtf_defaults() -> None:
     assert ALLOW_LIVE_TRADING is False
     assert USE_POST_ONLY is True
     print("    MTF constants")
+
+
+def test_macro_and_weekend_env_overrides() -> None:
+    import os
+
+    from core.config import get_settings
+
+    keys = {
+        "GEMINI_API_KEY": "test-key",
+        "MACRO_ADX_THRESHOLD": "18.5",
+        "WEEKEND_STAND_DOWN_START_WEEKDAY": "4",
+        "WEEKEND_STAND_DOWN_START_HOUR": "22",
+        "WEEKEND_STAND_DOWN_END_WEEKDAY": "0",
+        "WEEKEND_STAND_DOWN_END_HOUR": "8",
+    }
+    previous = {name: os.environ.get(name) for name in keys}
+    os.environ.update(keys)
+    get_settings.cache_clear()
+    try:
+        cfg = get_settings()
+        assert cfg.macro_adx_threshold == 18.5
+        assert cfg.weekend_stand_down_start_weekday == 4
+        assert cfg.weekend_stand_down_start_hour == 22
+        assert cfg.weekend_stand_down_end_weekday == 0
+        assert cfg.weekend_stand_down_end_hour == 8
+        assert cfg.weekend_stand_down is True
+        assert cfg.paper_trading is True
+        assert cfg.allow_live_trading is False
+        assert cfg.spot_long_only is True
+        assert cfg.position_size_fraction == 0.25
+        assert cfg.atr_stop_multiplier == 1.5
+        assert cfg.atr_profit_multiplier == 3.5
+        assert cfg.min_confidence == 0.6
+    finally:
+        get_settings.cache_clear()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("    macro ADX and weekend window are env-overridable")
 
 
 def test_free_quote_balance_prefers_usd_then_zusd() -> None:
@@ -194,6 +244,7 @@ def test_on_disk_runner_json() -> None:
 def main() -> int:
     checks = [
         ("MTF defaults", test_mtf_defaults),
+        ("macro and weekend env overrides", test_macro_and_weekend_env_overrides),
         ("empty book", test_empty_book_schema),
         ("legacy migrate", test_migrate_legacy_book_and_breaker),
         ("canonical dump", test_dump_canonical_state),
