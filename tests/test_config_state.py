@@ -64,7 +64,7 @@ def test_mtf_defaults() -> None:
     assert TRIGGER_EMA_FAST == 9
     assert TRIGGER_EMA_SLOW == 21
     assert MAX_OPEN_POSITIONS == 2
-    assert POSITION_SIZE_FRACTION == 0.25
+    assert POSITION_SIZE_FRACTION == 0.33
     assert ATR_STOP_MULTIPLIER == 1.5
     assert ATR_PROFIT_MULTIPLIER == 4.5
     assert TRAIL_ACTIVATE_MULT == 2.0
@@ -107,7 +107,7 @@ def test_macro_and_weekend_env_overrides() -> None:
         assert cfg.paper_trading is True
         assert cfg.allow_live_trading is False
         assert cfg.spot_long_only is True
-        assert cfg.position_size_fraction == 0.25
+        assert cfg.position_size_fraction == 0.33
         assert cfg.atr_stop_multiplier == 1.5
         assert cfg.atr_profit_multiplier == 4.5
         assert cfg.trail_activate_mult == 2.0
@@ -144,7 +144,7 @@ def test_risk_reward_env_overrides() -> None:
         assert cfg.atr_profit_multiplier == 5.0
         assert cfg.trail_activate_mult == 1.8
         assert cfg.atr_trail_mult == 1.4
-        assert cfg.position_size_fraction == 0.25
+        assert cfg.position_size_fraction == 0.33
         assert cfg.max_open_positions == 2
         assert cfg.paper_trading is True
         assert cfg.allow_live_trading is False
@@ -158,6 +158,42 @@ def test_risk_reward_env_overrides() -> None:
             else:
                 os.environ[name] = value
     print("    stop, target, and trail knobs are env-overridable")
+
+
+def test_position_size_fraction_env_override() -> None:
+    """VPS sets POSITION_SIZE_FRACTION in .env. Other phase knobs stay put."""
+    import os
+
+    from core.config import get_settings
+
+    keys = {
+        "GEMINI_API_KEY": "test-key",
+        "POSITION_SIZE_FRACTION": "0.31",
+    }
+    previous = {name: os.environ.get(name) for name in keys}
+    os.environ.update(keys)
+    get_settings.cache_clear()
+    try:
+        cfg = get_settings()
+        assert cfg.position_size_fraction == 0.31
+        assert cfg.max_open_positions == 2
+        assert cfg.atr_stop_multiplier == 1.5
+        assert cfg.atr_profit_multiplier == 4.5
+        assert cfg.trail_activate_mult == 2.0
+        assert cfg.atr_trail_mult == 1.5
+        assert cfg.paper_trading is True
+        assert cfg.allow_live_trading is False
+        assert cfg.spot_long_only is True
+        assert cfg.macro_adx_threshold == 16.0
+        assert cfg.min_confidence == 0.6
+    finally:
+        get_settings.cache_clear()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("    POSITION_SIZE_FRACTION is env-overridable")
 
 
 def test_free_quote_balance_prefers_usd_then_zusd() -> None:
@@ -293,6 +329,7 @@ def main() -> int:
         ("MTF defaults", test_mtf_defaults),
         ("macro and weekend env overrides", test_macro_and_weekend_env_overrides),
         ("risk reward env overrides", test_risk_reward_env_overrides),
+        ("position size fraction env override", test_position_size_fraction_env_override),
         ("empty book", test_empty_book_schema),
         ("legacy migrate", test_migrate_legacy_book_and_breaker),
         ("canonical dump", test_dump_canonical_state),

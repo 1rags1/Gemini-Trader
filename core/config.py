@@ -82,10 +82,11 @@ TRIGGER_ATR_PERIOD = 14
 #: Hard cap on concurrent paper positions across the whole book.
 MAX_OPEN_POSITIONS = 2
 
-#: Fraction of current equity allocated to each new fill. With
-#: MAX_OPEN_POSITIONS = 2, 0.25 uses about half of equity and leaves the
-#: rest as a cash buffer for fees and slippage.
-POSITION_SIZE_FRACTION = 0.25
+#: Fraction of current equity allocated to each new fill. Existing open
+#: slots keep the size they were filled at. With MAX_OPEN_POSITIONS = 2,
+#: 0.33 uses about two thirds of equity and leaves the rest as a cash
+#: buffer for fees and slippage. Override with POSITION_SIZE_FRACTION.
+POSITION_SIZE_FRACTION = 0.33
 
 #: Stop and target multiples of the 1h ATR. 1.5 / 4.5 is 1:3, so one full
 #: target covers about three stopped trades. The stop stays at 1.5: a stop
