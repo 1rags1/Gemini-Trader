@@ -9,10 +9,12 @@ pullback entry. Longs fire only when the 1h regime is BULL or SOFT_BULL and
 15m price tags EMA 21 then closes back above it. SOFT_BULL means the close is
 above EMA 200 with ADX at MACRO_ADX_THRESHOLD even if EMA 21 is not above
 EMA 55. A strong BEAR (close under EMA 200, EMA 21 under EMA 55, ADX at the
-threshold) cannot open a long. Stops and targets are 1h ATR multiples.
-The ATR trail from the Pine params arms once price is 2.75x entry ATR in
-profit. Saturday 00:00 UTC through Sunday 12:00 UTC takes no new entries
-when WEEKEND_STAND_DOWN is true.
+threshold) cannot open a long. Stops and targets are 1h ATR multiples
+(default stop 1.5, target 4.5). The trailing stop arms after
+TRAIL_ACTIVATE_MULT entry-ATR of open profit (default 2.0) and then
+ratchets ATR_TRAIL_MULT live ATR behind price (default 1.5). Saturday
+00:00 UTC through Sunday 12:00 UTC takes no new entries when
+WEEKEND_STAND_DOWN is true.
 
     python -m core.strategy_runner --once
     python -m core.strategy_runner --poll-interval 30
@@ -53,6 +55,7 @@ from core.config import (
     ALLOW_LIVE_TRADING,
     ATR_PROFIT_MULTIPLIER,
     ATR_STOP_MULTIPLIER,
+    ATR_TRAIL_MULT,
     MACRO_ADX_THRESHOLD,
     MACRO_TIMEFRAME,
     MAX_OPEN_POSITIONS,
@@ -61,6 +64,7 @@ from core.config import (
     POSITION_SIZE_FRACTION,
     SPOT_LONG_ONLY,
     TRADING_PAIRS,
+    TRAIL_ACTIVATE_MULT,
     TRIGGER_TIMEFRAME,
     USE_POST_ONLY,
     WEEKEND_ADX_THRESHOLD,
@@ -455,6 +459,24 @@ def mtf_maybe_exit(
     return None
 
 
+def exit_risk_params(
+    params: dict[str, Any] | None = None,
+    *,
+    trail_activate_mult: float = TRAIL_ACTIVATE_MULT,
+    atr_trail_mult: float = ATR_TRAIL_MULT,
+) -> dict[str, Any]:
+    """Copy strategy params and apply the paper trail knobs.
+
+    Circuit-breaker and commission keys stay on the strategy file. The trail
+    the paper book uses is `trail_activate_mult` / `atr_trail_mult` from
+    config, so an env override reaches `update_trail`.
+    """
+    merged = dict(params or {})
+    merged["trail_activate_mult"] = float(trail_activate_mult)
+    merged["atr_trail_mult"] = float(atr_trail_mult)
+    return merged
+
+
 def update_trail(position: Position, close: float, atr: float, params: dict[str, Any]) -> Position:
     """Arm and ratchet the trailing stop the same way the Pine script does.
 
@@ -737,6 +759,8 @@ class StrategyRunner:
             self.trigger_timeframe = TRIGGER_TIMEFRAME
             self.atr_stop_mult = ATR_STOP_MULTIPLIER
             self.atr_profit_mult = ATR_PROFIT_MULTIPLIER
+            self.trail_activate_mult = TRAIL_ACTIVATE_MULT
+            self.atr_trail_mult = ATR_TRAIL_MULT
             self.adx_threshold = MACRO_ADX_THRESHOLD
             self.weekend_stand_down = WEEKEND_STAND_DOWN
             self.weekend_start_weekday = WEEKEND_STAND_DOWN_START_WEEKDAY
@@ -760,6 +784,10 @@ class StrategyRunner:
             self.trigger_timeframe = self.settings.trigger_timeframe or TRIGGER_TIMEFRAME
             self.atr_stop_mult = float(self.settings.atr_stop_multiplier or ATR_STOP_MULTIPLIER)
             self.atr_profit_mult = float(self.settings.atr_profit_multiplier or ATR_PROFIT_MULTIPLIER)
+            self.trail_activate_mult = float(
+                self.settings.trail_activate_mult or TRAIL_ACTIVATE_MULT
+            )
+            self.atr_trail_mult = float(self.settings.atr_trail_mult or ATR_TRAIL_MULT)
             self.adx_threshold = float(self.settings.macro_adx_threshold or MACRO_ADX_THRESHOLD)
             self.weekend_stand_down = bool(self.settings.weekend_stand_down)
             self.weekend_start_weekday = int(self.settings.weekend_stand_down_start_weekday)
@@ -855,6 +883,13 @@ class StrategyRunner:
         if self._params is None:
             self._params = load_strategy(STRATEGY_NAME).params
         return self._params
+
+    def _exit_risk_params(self) -> dict[str, Any]:
+        return exit_risk_params(
+            self.params,
+            trail_activate_mult=self.trail_activate_mult,
+            atr_trail_mult=self.atr_trail_mult,
+        )
 
     def strategy_context(self) -> str:
         if self._strategy_context is None:
@@ -1644,7 +1679,7 @@ class StrategyRunner:
                     close=float(bar["close"]),
                     regime=item["macro_regime"],
                     atr=live_atr,
-                    params=self.params,
+                    params=self._exit_risk_params(),
                 )
                 if exit_event is not None:
                     exit_bar = bar

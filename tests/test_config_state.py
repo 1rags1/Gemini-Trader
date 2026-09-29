@@ -13,6 +13,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.config import (
     ATR_PROFIT_MULTIPLIER,
     ATR_STOP_MULTIPLIER,
+    ATR_TRAIL_MULT,
+    TRAIL_ACTIVATE_MULT,
     MACRO_ADX_THRESHOLD,
     WEEKEND_STAND_DOWN,
     WEEKEND_STAND_DOWN_END_HOUR,
@@ -64,7 +66,13 @@ def test_mtf_defaults() -> None:
     assert MAX_OPEN_POSITIONS == 2
     assert POSITION_SIZE_FRACTION == 0.25
     assert ATR_STOP_MULTIPLIER == 1.5
-    assert ATR_PROFIT_MULTIPLIER == 3.5
+    assert ATR_PROFIT_MULTIPLIER == 4.5
+    assert TRAIL_ACTIVATE_MULT == 2.0
+    assert ATR_TRAIL_MULT == 1.5
+    assert TRAIL_ACTIVATE_MULT > ATR_TRAIL_MULT
+    locked_r = (TRAIL_ACTIVATE_MULT - ATR_TRAIL_MULT) / ATR_STOP_MULTIPLIER
+    assert abs(locked_r - (0.5 / 1.5)) < 1e-9
+    assert abs(ATR_PROFIT_MULTIPLIER / ATR_STOP_MULTIPLIER - 3.0) < 1e-9
     assert SPOT_LONG_ONLY is True
     assert PAPER_TRADING is True
     assert ALLOW_LIVE_TRADING is False
@@ -101,7 +109,9 @@ def test_macro_and_weekend_env_overrides() -> None:
         assert cfg.spot_long_only is True
         assert cfg.position_size_fraction == 0.25
         assert cfg.atr_stop_multiplier == 1.5
-        assert cfg.atr_profit_multiplier == 3.5
+        assert cfg.atr_profit_multiplier == 4.5
+        assert cfg.trail_activate_mult == 2.0
+        assert cfg.atr_trail_mult == 1.5
         assert cfg.min_confidence == 0.6
     finally:
         get_settings.cache_clear()
@@ -111,6 +121,43 @@ def test_macro_and_weekend_env_overrides() -> None:
             else:
                 os.environ[name] = value
     print("    macro ADX and weekend window are env-overridable")
+
+
+def test_risk_reward_env_overrides() -> None:
+    import os
+
+    from core.config import get_settings
+
+    keys = {
+        "GEMINI_API_KEY": "test-key",
+        "ATR_STOP_MULTIPLIER": "1.4",
+        "ATR_PROFIT_MULTIPLIER": "5",
+        "TRAIL_ACTIVATE_MULT": "1.8",
+        "ATR_TRAIL_MULT": "1.4",
+    }
+    previous = {name: os.environ.get(name) for name in keys}
+    os.environ.update(keys)
+    get_settings.cache_clear()
+    try:
+        cfg = get_settings()
+        assert cfg.atr_stop_multiplier == 1.4
+        assert cfg.atr_profit_multiplier == 5.0
+        assert cfg.trail_activate_mult == 1.8
+        assert cfg.atr_trail_mult == 1.4
+        assert cfg.position_size_fraction == 0.25
+        assert cfg.max_open_positions == 2
+        assert cfg.paper_trading is True
+        assert cfg.allow_live_trading is False
+        assert cfg.spot_long_only is True
+        assert cfg.macro_adx_threshold == 16.0
+    finally:
+        get_settings.cache_clear()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("    stop, target, and trail knobs are env-overridable")
 
 
 def test_free_quote_balance_prefers_usd_then_zusd() -> None:
@@ -245,6 +292,7 @@ def main() -> int:
     checks = [
         ("MTF defaults", test_mtf_defaults),
         ("macro and weekend env overrides", test_macro_and_weekend_env_overrides),
+        ("risk reward env overrides", test_risk_reward_env_overrides),
         ("empty book", test_empty_book_schema),
         ("legacy migrate", test_migrate_legacy_book_and_breaker),
         ("canonical dump", test_dump_canonical_state),
