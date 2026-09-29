@@ -22,7 +22,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.gemini_agent import Decision, system_instruction
 from core.broker import PairLimits, limits_from_market, prepare_order_size, truncate_qty
-from core.config import POSITION_SIZE_FRACTION, TRADING_PAIRS
+from core.config import (
+    ATR_PROFIT_MULTIPLIER,
+    ATR_STOP_MULTIPLIER,
+    ATR_TRAIL_MULT,
+    POSITION_SIZE_FRACTION,
+    TRAIL_ACTIVATE_MULT,
+    TRADING_PAIRS,
+)
 from core.order_lifecycle import LiveTradingDisabled, classify_order
 from core.market_data import classify_macro_regime
 from core.strategy_runner import (
@@ -34,6 +41,7 @@ from core.strategy_runner import (
     count_open_positions,
     detect_signal,
     detect_trigger,
+    exit_risk_params,
     fraction_qty,
     last_closed_ts,
     maybe_exit,
@@ -59,8 +67,8 @@ SUNDAY_NOON = pd.Timestamp("2026-01-04 12:00:00", tz="UTC")
 SUNDAY_EVENING = pd.Timestamp("2026-01-04 20:00:00", tz="UTC")
 TRIGGER_START = pd.Timestamp("2026-01-01 04:00:00", tz="UTC")
 PULLBACK_ENTRY = 10020.0
-PULLBACK_STOP = PULLBACK_ENTRY - 1.5 * 100
-PULLBACK_TARGET = PULLBACK_ENTRY + 3.5 * 100
+PULLBACK_STOP = PULLBACK_ENTRY - ATR_STOP_MULTIPLIER * 100
+PULLBACK_TARGET = PULLBACK_ENTRY + ATR_PROFIT_MULTIPLIER * 100
 
 
 class StubAgent:
@@ -294,8 +302,8 @@ def test_macro_regime_and_trigger() -> None:
     signal = detect_trigger(closed, stop_atr=200)
     assert signal is not None and signal.action == "BUY"
     assert signal.reason == "mtf_15m_ema_pullback_long"
-    assert abs(signal.stop - (10020 - 1.5 * 200)) < 1e-9
-    assert abs(signal.target - (10020 + 3.5 * 200)) < 1e-9
+    assert abs(signal.stop - (10020 - ATR_STOP_MULTIPLIER * 200)) < 1e-9
+    assert abs(signal.target - (10020 + ATR_PROFIT_MULTIPLIER * 200)) < 1e-9
     assert detect_trigger(trigger_flat_frame().loc[: trigger_flat_frame().index[5]]) is None
     assert detect_trigger(trigger_late_cross_frame().loc[: trigger_late_cross_frame().index[5]]) is None
     mixed = _row(10000, 100.5, 99.0, adx=25.0, ema_macro=11000)
@@ -348,6 +356,7 @@ def test_short_signal() -> None:
 
 
 def test_trail_arms_at_2_75_and_locks_0_67r() -> None:
+    """Pine file trail math in strategies/params/ema_atr_trend.json."""
     pos = Position(
         side="LONG",
         entry_price=10000,
@@ -765,6 +774,8 @@ def test_gemini_prompt_matches_mode() -> None:
     assert "enforced in code" in paper and "enforced in code" in live
     assert "cannot" in paper.lower()
     assert "1h ATR" in paper
+    assert "4.5x" in paper
+    assert "2.0x" in paper
     assert "pullback" in paper.lower()
     print("    prompt follows paper vs live")
 
@@ -1350,14 +1361,108 @@ def test_chop_does_not_flatten_long() -> None:
     print("    strong-ADX mixed stack is chop, long held")
 
 
-def test_mtf_trail_arms_then_exits() -> None:
+def test_paper_trail_arms_at_2_atr_and_locks_a_winner() -> None:
+    """Paper trail uses config (arm 2.0, distance 1.5), not the Pine 2.75 / 1.75."""
+    assert TRAIL_ACTIVATE_MULT == 2.0
+    assert ATR_TRAIL_MULT == 1.5
+    assert ATR_PROFIT_MULTIPLIER == 4.5
+    params = exit_risk_params(PARAMS)
+    assert params["trail_activate_mult"] == 2.0
+    assert params["atr_trail_mult"] == 1.5
+    assert params["commission_pct"] == PARAMS["commission_pct"]
+    # The Pine file keeps its own trail. The overlay is what the paper book runs.
+    assert float(PARAMS["trail_activate_mult"]) == 2.75
+    assert float(PARAMS["atr_trail_mult"]) == 1.75
+
     pos = Position(
         side="LONG",
         entry_price=10000,
         entry_atr=100,
         qty=1,
         stop=9850,
-        target=10350,
+        target=10450,
+        trail_stop=9850,
+        trail_armed=False,
+        opened_bar="x",
+        confidence=0.9,
+        model="stub",
+        rationale="",
+        reason="t",
+    )
+    shy = mtf_maybe_exit(
+        pos, high=10200, low=10100, close=10190, regime="BULL", atr=100, params=params
+    )
+    assert shy is None
+    assert pos.trail_armed is False
+    assert pos.trail_stop == 9850
+
+    held = mtf_maybe_exit(
+        pos, high=10240, low=10150, close=10220, regime="BULL", atr=100, params=params
+    )
+    assert held is None
+    assert pos.trail_armed is True
+    # 10220 - 1.5*100 = 10070, about +0.47R. The floor at the exact 2.0 arm is +0.33R.
+    assert pos.trail_stop == 10070
+    hit = mtf_maybe_exit(
+        pos, high=10120, low=10060, close=10100, regime="BULL", atr=100, params=params
+    )
+    assert hit is not None
+    assert hit.reason == "atr_trail_long"
+    assert hit.hit == "stop"
+    assert hit.price == 10070
+    assert hit.price > pos.entry_price
+    print(f"    paper trail locked {hit.price}")
+
+
+def test_runner_trail_banks_a_winner_before_the_pine_arm() -> None:
+    """A +2.0 ATR print trails out in profit. The Pine arm (2.75) would still be idle."""
+    tmp = tmpdir()
+    runner = runner_for(macro_bull_frame(), trigger_cross_frame(), StubAgent("BUY", 0.9), tmp)
+    opened = runner.cycle(now=NOW)
+    assert opened.position == "LONG"
+    assert runner.trail_activate_mult == 2.0
+    assert runner.atr_trail_mult == 1.5
+    assert float(runner.params["trail_activate_mult"]) == 2.75
+
+    arm_close = PULLBACK_ENTRY + TRAIL_ACTIVATE_MULT * 100
+    trail_level = arm_close - ATR_TRAIL_MULT * 100
+    assert trail_level > PULLBACK_ENTRY
+    assert arm_close < PULLBACK_ENTRY + float(PARAMS["trail_activate_mult"]) * 100
+
+    punched = trigger_cross_frame()
+    punched.loc[punched.index[6], ["low", "close", "high"]] = (
+        trail_level - 10,
+        arm_close,
+        arm_close + 10,
+    )
+    extra = punched.copy()
+    extra.loc[pd.Timestamp("2026-01-01 05:45:00", tz="UTC")] = _row(
+        arm_close, 100.4, 100, atr=100, low=arm_close - 10, high=arm_close + 10
+    )
+    later = pd.Timestamp("2026-01-01 05:52:00", tz="UTC")
+    runner.fetch_fn = lambda *, timeframe, **_k: (
+        macro_bull_frame() if timeframe == "1h" else extra
+    )
+    report = runner.cycle(now=later)
+    assert report.reason == "atr_trail_long"
+    assert report.position == "FLAT"
+    rows = list(csv.DictReader((tmp / "paper_trades.csv").open(encoding="utf-8")))
+    assert rows[-1]["action"] == "CLOSE"
+    assert rows[-1]["hit"] == "stop"
+    assert abs(float(rows[-1]["exit_price"]) - trail_level) < 1e-6
+    assert float(rows[-1]["pnl"]) > 0
+    print(f"    runner banked trail at {trail_level}, pnl={rows[-1]['pnl']}")
+
+
+def test_mtf_trail_arms_then_exits() -> None:
+    params = exit_risk_params(PARAMS)
+    pos = Position(
+        side="LONG",
+        entry_price=10000,
+        entry_atr=100,
+        qty=1,
+        stop=9850,
+        target=10450,
         trail_stop=9850,
         trail_armed=False,
         opened_bar="x",
@@ -1367,16 +1472,18 @@ def test_mtf_trail_arms_then_exits() -> None:
         reason="t",
     )
     still_open = mtf_maybe_exit(
-        pos, high=10300, low=10200, close=10280, regime="BULL", atr=100, params=PARAMS
+        pos, high=10240, low=10150, close=10220, regime="BULL", atr=100, params=params
     )
     assert still_open is None
     assert pos.trail_armed is True
+    assert pos.trail_stop == 10070
     hit = mtf_maybe_exit(
-        pos, high=10200, low=10100, close=10150, regime="BULL", atr=100, params=PARAMS
+        pos, high=10120, low=10060, close=10100, regime="BULL", atr=100, params=params
     )
     assert hit is not None
     assert hit.reason == "atr_trail_long"
     assert hit.hit == "stop"
+    assert hit.price == 10070
     print("    MTF trail armed and captured")
 
 
@@ -1387,7 +1494,9 @@ def main() -> int:
         ("MTF regime + trigger", test_macro_regime_and_trigger),
         ("MTF exits", test_mtf_stop_and_regime_exit),
         ("short signal", test_short_signal),
-        ("trail arm 2.75 / 1.75", test_trail_arms_at_2_75_and_locks_0_67r),
+        ("pine file trail 2.75 / 1.75", test_trail_arms_at_2_75_and_locks_0_67r),
+        ("paper trail arm 2.0 / 1.5", test_paper_trail_arms_at_2_atr_and_locks_a_winner),
+        ("runner trail banks winner", test_runner_trail_banks_a_winner_before_the_pine_arm),
         ("stop beats target same bar", test_stop_beats_target_on_same_bar),
         ("circuit breaker 4 / 24", test_circuit_breaker_trips_on_four_losses),
         ("risk sizing", test_risk_sizing_is_capped),

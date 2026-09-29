@@ -87,9 +87,19 @@ MAX_OPEN_POSITIONS = 2
 #: rest as a cash buffer for fees and slippage.
 POSITION_SIZE_FRACTION = 0.25
 
-#: Stop and target multiples of the 1h ATR. 1.5 / 3.5 is about 1 : 2.33.
+#: Stop and target multiples of the 1h ATR. 1.5 / 4.5 is 1:3, so one full
+#: target covers about three stopped trades. The stop stays at 1.5: a stop
+#: tighter than about 1.2 sits inside weekend noise.
 ATR_STOP_MULTIPLIER = 1.5
-ATR_PROFIT_MULTIPLIER = 3.5
+ATR_PROFIT_MULTIPLIER = 4.5
+
+#: Paper trailing stop. Arms after this many entry-ATR of open profit, then
+#: ratchets `ATR_TRAIL_MULT` of live ATR behind price and only moves in the
+#: trade's favor. Arm 2.0 and trail 1.5 lock about +0.33R when the trail
+#: first arms: (arm - trail) / stop = (2.0 - 1.5) / 1.5. The trail width
+#: matches the initial stop. Env: TRAIL_ACTIVATE_MULT, ATR_TRAIL_MULT.
+TRAIL_ACTIVATE_MULT = 2.0
+ATR_TRAIL_MULT = 1.5
 
 #: Spot accounts cannot sell short. The runner skips SELL entries when True.
 SPOT_LONG_ONLY = True
@@ -137,6 +147,8 @@ class Settings:
     position_size_fraction: float = POSITION_SIZE_FRACTION
     atr_stop_multiplier: float = ATR_STOP_MULTIPLIER
     atr_profit_multiplier: float = ATR_PROFIT_MULTIPLIER
+    trail_activate_mult: float = TRAIL_ACTIVATE_MULT
+    atr_trail_mult: float = ATR_TRAIL_MULT
     spot_long_only: bool = SPOT_LONG_ONLY
     paper_trading: bool = PAPER_TRADING
     allow_live_trading: bool = ALLOW_LIVE_TRADING
@@ -478,6 +490,8 @@ def get_settings() -> Settings:
         atr_profit_multiplier=float(
             os.getenv("ATR_PROFIT_MULTIPLIER", str(ATR_PROFIT_MULTIPLIER))
         ),
+        trail_activate_mult=float(os.getenv("TRAIL_ACTIVATE_MULT", str(TRAIL_ACTIVATE_MULT))),
+        atr_trail_mult=float(os.getenv("ATR_TRAIL_MULT", str(ATR_TRAIL_MULT))),
         spot_long_only=_env_bool("SPOT_LONG_ONLY", SPOT_LONG_ONLY),
         paper_trading=_env_bool("PAPER_TRADING", PAPER_TRADING),
         allow_live_trading=_env_bool("ALLOW_LIVE_TRADING", ALLOW_LIVE_TRADING),
