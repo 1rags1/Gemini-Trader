@@ -599,7 +599,7 @@ def test_multi_pair_scan_caps_opens_and_sizes() -> None:
     assert saved["positions"]["SOL/USD"]["status"] == "LONG"
     assert saved["positions"]["ETH/USD"]["status"] == "FLAT"
     assert agent.calls == 2
-    print("    scanned 3 pairs x 2 timeframes, opened BTC+SOL, sized 25%")
+    print("    scanned 3 pairs x 2 timeframes, opened BTC+SOL, sized 33%")
 
 
 def test_alt_correlation_blocks_second_alt() -> None:
@@ -646,7 +646,12 @@ def test_alt_correlation_blocks_second_alt() -> None:
     sol = next(leg for leg in report.legs if leg.symbol == "SOL/USD")
     assert sol.reason == "alt_correlation_cap"
     assert correlation_block_reason("SOL/USD", runner.state.positions) == "alt_correlation_cap"
-    print("    ETH open blocked SOL; BTC still filled")
+    # The seeded ETH fill keeps its size. Only the new BTC entry uses the fraction.
+    assert runner.state.positions["ETH/USD"]["size"] == 0.1
+    assert runner.state.positions["ETH/USD"]["qty"] == 0.1
+    btc_qty = runner.state.positions["BTC/USD"]["qty"]
+    assert abs(btc_qty - truncate_qty(10_000 * POSITION_SIZE_FRACTION / PULLBACK_ENTRY, 8)) < 1e-12
+    print("    ETH open blocked SOL; BTC still filled; seeded size unchanged")
 
 
 def test_same_bar_alts_prefer_higher_adx() -> None:

@@ -19,7 +19,7 @@ If paper mode is turned off and `ALLOW_LIVE_TRADING` is still false, the runner 
 
 Live entries are post-only limit orders. An accepted order is not treated as an open position. The runner stores the order id and opens the local slot only after the exchange reports a fill. A cancel or expiry clears the pending order and leaves the slot flat. Market exits are sent when a stop, target, or regime flip closes a position that is already open.
 
-Each new position uses `POSITION_SIZE_FRACTION` of equity (default `0.25`). With `MAX_OPEN_POSITIONS=2`, two full slots use about half of equity. The rest stays in cash for fees and slippage.
+Each new position uses `POSITION_SIZE_FRACTION` of equity (default `0.33`). With `MAX_OPEN_POSITIONS=2`, two full slots use about two thirds of equity. The rest stays in cash for fees and slippage. An open position keeps the size it was filled at; changing the fraction applies only to later entries. Set `POSITION_SIZE_FRACTION` in `.env` to override the default.
 
 Gemini is told whether the process is in paper or live mode. That text is only context. Position size, the circuit breaker, the altcoin cap, spot long-only, and post-only entries are enforced in code. The model cannot override them.
 
